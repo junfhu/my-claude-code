@@ -282,6 +282,84 @@ git push origin main
 
 ---
 
+## Use It in Claude Code (MCP Server)
+
+This repo includes an MCP server that lets you explore the Claude Code source directly from any Claude session. One command to set it up:
+
+### Quick Start
+
+```bash
+# Clone the repo (if you haven't already)
+git clone https://github.com/nirholas/claude-code.git
+cd claude-code/mcp-server
+
+# Install dependencies and build
+npm install && npm run build
+
+# Add to Claude Code (run from the repo root)
+claude mcp add claude-code-explorer -- node /absolute/path/to/claude-code/mcp-server/dist/index.js
+```
+
+Replace `/absolute/path/to/claude-code` with the actual path where you cloned the repo.
+
+**Or as a single copy-paste block** (clones, builds, and registers in one go):
+
+```bash
+git clone https://github.com/nirholas/claude-code.git ~/claude-code \
+  && cd ~/claude-code/mcp-server \
+  && npm install && npm run build \
+  && claude mcp add claude-code-explorer -- node ~/claude-code/mcp-server/dist/index.js
+```
+
+### What You Get
+
+Once added, Claude has access to these tools for exploring the codebase:
+
+| Tool | Description |
+|------|-------------|
+| `list_tools` | List all ~40 agent tools with source files |
+| `list_commands` | List all ~50 slash commands with source files |
+| `get_tool_source` | Read full source of any tool (e.g. `BashTool`, `FileEditTool`) |
+| `get_command_source` | Read source of any slash command (e.g. `review`, `mcp`) |
+| `read_source_file` | Read any file from `src/` by path |
+| `search_source` | Grep across the entire source tree |
+| `list_directory` | Browse `src/` directories |
+| `get_architecture` | High-level architecture overview |
+
+Plus **prompts** for guided exploration:
+
+- `explain_tool` — Deep-dive into how a specific tool works
+- `explain_command` — Understand a slash command's implementation
+- `architecture_overview` — Guided tour of the full architecture
+- `how_does_it_work` — Explain any subsystem (permissions, MCP, bridge, etc.)
+- `compare_tools` — Side-by-side comparison of two tools
+
+### Example Usage
+
+After adding the MCP server, just ask Claude naturally:
+
+> "How does the BashTool work?"
+> "Search for where permissions are checked"
+> "Show me the /review command source"
+> "Explain the MCP client integration"
+
+### Custom Source Path
+
+If your `src/` directory is in a non-standard location, set the environment variable:
+
+```bash
+claude mcp add claude-code-explorer -e CLAUDE_CODE_SRC_ROOT=/path/to/src -- node /path/to/mcp-server/dist/index.js
+```
+
+### Remove It
+
+```bash
+claude mcp remove claude-code-explorer
+```
+
+---
+
 ## Disclaimer
 
 This repository archives source code that was leaked from Anthropic's npm registry on **2026-03-31**. All original source code is the property of [Anthropic](https://www.anthropic.com). Contact [nichxbt](https://www.x.com/nichxbt) for any comments.
+
