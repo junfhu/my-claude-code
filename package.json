@@ -13,6 +13,9 @@
     "build": "bun scripts/build-bundle.ts",
     "build:watch": "bun scripts/build-bundle.ts --watch",
     "build:prod": "bun scripts/build-bundle.ts --minify",
+    "build:web": "bun scripts/build-web.ts",
+    "build:web:watch": "bun scripts/build-web.ts --watch",
+    "build:web:prod": "bun scripts/build-web.ts --minify",
     "typecheck": "tsc --noEmit",
     "lint": "biome check src/",
     "lint:fix": "biome check --write src/",
@@ -30,6 +33,7 @@
     "@opentelemetry/sdk-logs": "^0.57.0",
     "@opentelemetry/sdk-metrics": "^1.30.0",
     "@opentelemetry/sdk-trace-base": "^1.30.0",
+    "auto-bind": "^5.0.1",
     "axios": "^1.7.0",
     "chalk": "^5.4.0",
     "chokidar": "^4.0.0",
@@ -43,13 +47,13 @@
     "ignore": "^6.0.0",
     "lodash-es": "^4.17.21",
     "marked": "^15.0.0",
+    "node-pty": "^1.1.0",
     "p-map": "^7.0.0",
     "picomatch": "^4.0.0",
     "proper-lockfile": "^4.1.2",
     "qrcode": "^1.5.0",
     "react": "^19.0.0",
     "react-reconciler": "^0.31.0",
-    "auto-bind": "^5.0.1",
     "semver": "^7.6.0",
     "stack-utils": "^2.0.6",
     "strip-ansi": "^7.1.0",
@@ -61,7 +65,13 @@
     "wrap-ansi": "^9.0.0",
     "ws": "^8.18.0",
     "yaml": "^2.6.0",
-    "zod": "^3.24.0"
+    "zod": "^3.24.0",
+    "@xterm/xterm": "^5.5.0",
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/addon-web-links": "^0.11.0",
+    "@xterm/addon-search": "^0.15.0",
+    "@xterm/addon-unicode11": "^0.8.0",
+    "@xterm/addon-webgl": "^0.18.0"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.0",
@@ -82,5 +92,3 @@
   },
   "packageManager": "bun@1.1.0"
 }
-
-

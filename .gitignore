@@ -12,6 +12,9 @@ build/
 .env.local
 .env.*.local
 
+# Prompts
+prompts/
+
 # OS files
 .DS_Store
 Thumbs.db
