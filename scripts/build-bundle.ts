@@ -63,6 +63,55 @@ const srcResolverPlugin: esbuild.Plugin = {
   },
 }
 
+// ── Plugin: load .md and .txt files as text modules ──
+const textLoaderPlugin: esbuild.Plugin = {
+  name: 'text-loader',
+  setup(build) {
+    build.onLoad({ filter: /\.(md|txt)$/ }, async (args) => {
+      const { readFileSync } = await import('fs')
+      const contents = readFileSync(args.path, 'utf-8')
+      return {
+        contents: `export default ${JSON.stringify(contents)}`,
+        loader: 'js',
+      }
+    })
+  },
+}
+
+// ── Plugin: resolve .d.ts imports (some files import global.d.ts) ──
+const dtsResolverPlugin: esbuild.Plugin = {
+  name: 'dts-resolver',
+  setup(build) {
+    build.onResolve({ filter: /\.d\.ts$/ }, () => ({
+      path: resolve(ROOT, 'src/global.d.ts'),
+      sideEffects: false,
+    }))
+    build.onLoad({ filter: /global\.d\.ts$/ }, () => ({
+      contents: '',
+      loader: 'js',
+    }))
+  },
+}
+
+// ── Plugin: resolve subpath imports for CJS stub packages ──
+// Stub packages in node_modules use CJS (module.exports = Proxy) so esbuild
+// can extract any named export. But subpath imports like '@ant/foo/types'
+// need to resolve to the same index.js.
+const stubSubpathPlugin: esbuild.Plugin = {
+  name: 'stub-subpath',
+  setup(build) {
+    // @ant/* packages with subpath imports
+    build.onResolve({ filter: /^@ant\/[^/]+\/.+/ }, (args) => {
+      const base = args.path.split('/').slice(0, 2).join('/')
+      const stubIndex = resolve(ROOT, 'node_modules', base, 'index.js')
+      if (existsSync(stubIndex)) {
+        return { path: stubIndex }
+      }
+      return undefined
+    })
+  },
+}
+
 const buildOptions: esbuild.BuildOptions = {
   entryPoints: [resolve(ROOT, 'src/entrypoints/cli.tsx')],
   bundle: true,
@@ -75,7 +124,7 @@ const buildOptions: esbuild.BuildOptions = {
   // Single-file output — no code splitting for CLI tools
   splitting: false,
 
-  plugins: [srcResolverPlugin],
+  plugins: [stubSubpathPlugin, srcResolverPlugin, textLoaderPlugin, dtsResolverPlugin],
 
   // Use tsconfig for baseUrl / paths resolution (complements plugin above)
   tsconfig: resolve(ROOT, 'tsconfig.json'),
@@ -85,9 +134,8 @@ const buildOptions: esbuild.BuildOptions = {
     'bun:bundle': resolve(ROOT, 'src/shims/bun-bundle.ts'),
   },
 
-  // Don't bundle node built-ins or problematic native packages
+  // Only externalize Node.js built-in modules
   external: [
-    // Node built-ins (with and without node: prefix)
     'fs', 'path', 'os', 'crypto', 'child_process', 'http', 'https',
     'net', 'tls', 'url', 'util', 'stream', 'events', 'buffer',
     'querystring', 'readline', 'zlib', 'assert', 'tty', 'worker_threads',
@@ -95,15 +143,8 @@ const buildOptions: esbuild.BuildOptions = {
     'string_decoder', 'module', 'vm', 'constants', 'domain',
     'console', 'process', 'v8', 'inspector',
     'node:*',
-    // Native addons that can't be bundled
-    'fsevents',
-    'sharp',
-    'image-processor-napi',
-    // Anthropic-internal packages (not published externally)
-    '@anthropic-ai/sandbox-runtime',
-    '@anthropic-ai/claude-agent-sdk',
-    // Anthropic-internal (@ant/) packages — gated behind USER_TYPE === 'ant'
-    '@ant/*',
+    // node-pty must stay external — it's a native addon loaded at runtime
+    'node-pty',
   ],
 
   jsx: 'automatic',
@@ -130,9 +171,16 @@ const buildOptions: esbuild.BuildOptions = {
     'process.env.NODE_ENV': minify ? '"production"' : '"development"',
   },
 
-  // Banner: shebang for direct CLI execution
+  // Banner: shebang + CJS require compatibility for ESM bundle
+  // Some bundled CJS packages (e.g. node-fetch in @anthropic-ai/sdk) use
+  // require() for Node built-ins. ESM doesn't have require() by default.
   banner: {
-    js: '#!/usr/bin/env node\n',
+    js: [
+      '#!/usr/bin/env node',
+      'import { createRequire as __cjsCreateRequire } from "module";',
+      'const require = __cjsCreateRequire(import.meta.url);',
+      '',
+    ].join('\n'),
   },
 
   // Handle the .js → .ts resolution that the codebase uses

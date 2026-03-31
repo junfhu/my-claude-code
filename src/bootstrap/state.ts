@@ -1090,6 +1090,14 @@ export function setKairosActive(value: boolean): void {
   STATE.kairosActive = value
 }
 
+export function isReplBridgeActive(): boolean {
+  return (STATE as any).replBridgeActive ?? false
+}
+
+export function setReplBridgeActive(value: boolean): void {
+  ;(STATE as any).replBridgeActive = value
+}
+
 export function getStrictToolResultPairing(): boolean {
   return STATE.strictToolResultPairing
 }
