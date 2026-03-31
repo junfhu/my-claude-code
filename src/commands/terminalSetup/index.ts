@@ -22,3 +22,4 @@ const terminalSetup = {
 
 export default terminalSetup
 
+
