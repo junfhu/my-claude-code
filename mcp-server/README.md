@@ -134,6 +134,30 @@ Once connected, you can ask your AI assistant things like:
 - Use the `explain_tool` prompt with "FileEditTool" to get a full breakdown
 - Use `how_does_it_work` with "bridge" to understand IDE integration
 
+## Publishing to MCP Registry
+
+This server is published to the [MCP Registry](https://registry.modelcontextprotocol.io) via GitHub Actions. On a tagged release (`v*`), the workflow:
+
+1. Publishes the npm package to npmjs.org
+2. Authenticates with the MCP Registry using GitHub OIDC
+3. Publishes the `server.json` metadata to the registry
+
+To publish manually:
+
+```bash
+# Install the MCP Publisher CLI
+curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+# Authenticate (GitHub OAuth)
+./mcp-publisher login github
+
+# Publish
+cd mcp-server
+../mcp-publisher publish
+```
+
+Registry name: `io.github.nirholas/claude-code-explorer-mcp`
+
 ## Development
 
 ```bash
