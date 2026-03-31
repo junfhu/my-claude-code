@@ -30,3 +30,4 @@ export const extraUsageNonInteractive = {
   load: () => import('./extra-usage-noninteractive.js'),
 } satisfies Command
 
+
