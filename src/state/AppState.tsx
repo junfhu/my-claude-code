@@ -1,3 +1,41 @@
+// =============================================================================
+// AppState.tsx — React Context bridge for the application store
+// =============================================================================
+//
+// This file is the React integration layer that connects the framework-agnostic
+// Store<AppState> (from store.ts) to the React component tree. It provides:
+//
+//   1. AppStateProvider  — A context provider component that creates the store,
+//      wires up settings watchers, and wraps children in Mailbox + Voice contexts.
+//
+//   2. useAppState(selector) — The primary hook for reading state. Uses React's
+//      `useSyncExternalStore` for tear-free reads with selector-based re-render
+//      optimization (only re-renders when the selected slice changes per Object.is).
+//
+//   3. useSetAppState()  — Returns just the setState updater (stable reference).
+//      Components that only write state will never re-render from state changes.
+//
+//   4. useAppStateStore() — Returns the full store object for non-React code.
+//
+//   5. useAppStateMaybeOutsideOfProvider(selector) — Safe version that returns
+//      undefined when no provider is in the tree (avoids throws in edge cases).
+//
+// Data flow:
+//   AppStateProvider
+//     └── creates Store<AppState> via createStore(initialState, onChangeAppState)
+//     └── provides store via AppStoreContext (React.createContext)
+//           │
+//           ├── useAppState(s => s.verbose) → useSyncExternalStore → re-render on change
+//           ├── useSetAppState() → store.setState (stable ref, no subscription)
+//           └── useAppStateStore() → full store (for imperative code)
+//
+// NOTE: This file contains React Compiler output (_c memoization cache).
+// The compiler rewrites component/hook bodies to use a memoization array ($)
+// that caches intermediate values between renders, replacing manual useMemo/
+// useCallback. The $[n] slots are the compiler's internal cache — do not
+// modify the index assignments.
+// =============================================================================
+
 import { c as _c } from "react/compiler-runtime";
 import { feature } from 'bun:bundle';
 import React, { useContext, useEffect, useEffectEvent, useState, useSyncExternalStore } from 'react';
@@ -24,7 +62,15 @@ import { type AppState, type AppStateStore, getDefaultAppState } from './AppStat
 // ./AppStateStore.js. Kept for back-compat during migration so .ts callers
 // can incrementally move off the .tsx import and stop pulling React.
 export { type AppState, type AppStateStore, type CompletionBoundary, getDefaultAppState, IDLE_SPECULATION_STATE, type SpeculationResult, type SpeculationState } from './AppStateStore.js';
+
+// The React context that holds the store instance. Consumers access it via
+// useAppState / useSetAppState hooks (never directly). Initialized to null
+// so that useAppStore() can detect missing providers and throw a helpful error.
 export const AppStoreContext = React.createContext<AppStateStore | null>(null);
+
+// Props for AppStateProvider — accepts children, optional initial state override
+// (for testing), and the onChange callback that fires side-effects on every
+// state transition (wired to onChangeAppState.ts in production).
 type Props = {
   children: React.ReactNode;
   initialState?: AppState;
@@ -33,7 +79,27 @@ type Props = {
     oldState: AppState;
   }) => void;
 };
+
+// Guard context to prevent nesting AppStateProviders (which would create
+// two independent stores, leading to subtle state divergence bugs).
 const HasAppStateContext = React.createContext<boolean>(false);
+
+// ---------------------------------------------------------------------------
+// AppStateProvider — Root provider component for the application state.
+//
+// Responsibilities:
+//   1. Creates the Store<AppState> instance (once, via useState initializer).
+//   2. On mount, checks if bypass-permissions mode was disabled by remote
+//      settings that loaded before React mounted — if so, patches the store.
+//   3. Watches for external settings file changes (useSettingsChange) and
+//      applies them to the store via applySettingsChange.
+//   4. Wraps children in MailboxProvider and VoiceProvider (Ant-only).
+//   5. Provides the store via AppStoreContext and sets HasAppStateContext=true
+//      to guard against nesting.
+//
+// This function body is React Compiler output — the _c(13) call allocates
+// a 13-slot memoization cache ($), and $[n] checks gate re-computation.
+// ---------------------------------------------------------------------------
 export function AppStateProvider(t0) {
   const $ = _c(13);
   const {
@@ -108,12 +174,25 @@ export function AppStateProvider(t0) {
   }
   return t6;
 }
+
+// State updater extracted for the bypass-permissions check in AppStateProvider.
+// Disables bypass-permissions mode when remote settings indicate it should be off.
+// Extracted as a named function (rather than inline arrow) for React Compiler
+// compatibility — the compiler requires stable function references for setState.
 function _temp(prev) {
   return {
     ...prev,
     toolPermissionContext: createDisabledBypassPermissionsContext(prev.toolPermissionContext)
   };
 }
+
+// ---------------------------------------------------------------------------
+// useAppStore — Internal hook that retrieves the store from context.
+// Throws a descriptive ReferenceError if called outside AppStateProvider,
+// ensuring early failure rather than silent undefined behavior.
+// All public hooks (useAppState, useSetAppState, useAppStateStore) delegate
+// to this for store access.
+// ---------------------------------------------------------------------------
 function useAppStore(): AppStateStore {
   // eslint-disable-next-line react-hooks/rules-of-hooks
   const store = useContext(AppStoreContext);
@@ -177,6 +256,10 @@ export function useSetAppState() {
 export function useAppStateStore() {
   return useAppStore();
 }
+
+// No-op subscribe function for useAppStateMaybeOutsideOfProvider — when there
+// is no store in context, we still need to satisfy useSyncExternalStore's
+// subscribe contract. This returns a no-op unsubscribe function.
 const NOOP_SUBSCRIBE = () => () => {};
 
 /**

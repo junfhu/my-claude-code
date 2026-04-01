@@ -1,3 +1,22 @@
+// QueryEngine.ts — Standalone query engine for headless/SDK conversations.
+//
+// This module owns the full lifecycle of a conversation session:
+//   - Message history management (mutableMessages grows across turns)
+//   - File state tracking (readFileState caches file contents for diff detection)
+//   - Permission denial tracking (for SDK reporting)
+//   - Usage accumulation (total tokens across all turns)
+//   - System prompt construction (default + custom + append + memory mechanics)
+//   - Coordination with the query loop (query.ts) via processUserInput → query()
+//
+// One QueryEngine per conversation. The SDK creates it once and calls
+// submitMessage() for each user turn. State persists across turns so the
+// model sees the full conversation history, file changes accumulate, and
+// token usage is tracked cumulatively.
+//
+// Key coordination flow:
+//   submitMessage() → processUserInput() → query() → queryLoop() → [yield messages]
+//   The for-await in submitMessage() consumes queryLoop's yielded messages,
+//   records transcripts, normalizes for SDK output, and tracks usage/cost.
 import { feature } from 'bun:bundle'
 import type { ContentBlockParam } from '@anthropic-ai/sdk/resources/messages.mjs'
 import { randomUUID } from 'crypto'
@@ -127,33 +146,63 @@ const snipProjection = feature('HISTORY_SNIP')
   : null
 /* eslint-enable @typescript-eslint/no-require-imports */
 
+// QueryEngineConfig — all configuration needed to create a QueryEngine.
+// Provided by the SDK caller (e.g. claude-desktop, cowork, headless CLI).
+// Most fields map directly to query loop parameters; some (like canUseTool)
+// are wrapped by the engine to add tracking (permission denials).
 export type QueryEngineConfig = {
+  // Working directory for the conversation. Set via setCwd() at the start of each turn.
   cwd: string
+  // Available tools (Read, Write, Bash, etc.) for the model to invoke.
   tools: Tools
+  // Slash commands (/compact, /clear, /help, etc.) available to the user.
   commands: Command[]
+  // Active MCP server connections providing additional tools and resources.
   mcpClients: MCPServerConnection[]
+  // Agent definitions for multi-agent orchestration (coordinator mode).
   agents: AgentDefinition[]
+  // Permission-checking function: determines allow/deny/ask for each tool invocation.
+  // The engine wraps this to track denials for SDK reporting.
   canUseTool: CanUseToolFn
+  // Accessor for the current application state (permissions, MCP, file history, etc.).
   getAppState: () => AppState
+  // State updater: applies a function to the previous AppState and persists the result.
   setAppState: (f: (prev: AppState) => AppState) => void
+  // Optional initial messages to seed the conversation (e.g. from --resume).
   initialMessages?: Message[]
+  // Cache of file contents, used for diff detection and file state tracking.
   readFileCache: FileStateCache
+  // Optional custom system prompt to replace the default system prompt entirely.
   customSystemPrompt?: string
+  // Optional text appended to the end of the system prompt (additive, not replacing).
   appendSystemPrompt?: string
+  // User-specified model override (e.g. from --model flag).
   userSpecifiedModel?: string
+  // Fallback model to switch to on high-demand errors (FallbackTriggeredError).
   fallbackModel?: string
+  // Thinking/reasoning configuration (adaptive, disabled, or explicit budget).
   thinkingConfig?: ThinkingConfig
+  // Maximum number of tool-use turns before the engine force-stops.
   maxTurns?: number
+  // Maximum spend in USD before the engine stops (cost guard).
   maxBudgetUsd?: number
+  // API task budget for output token allocation.
   taskBudget?: { total: number }
+  // JSON schema for structured output enforcement via SyntheticOutputTool.
   jsonSchema?: Record<string, unknown>
+  // Whether to log verbose debug output.
   verbose?: boolean
+  // Whether to replay user messages back to the SDK as SDKUserMessageReplay events.
   replayUserMessages?: boolean
   /** Handler for URL elicitations triggered by MCP tool -32042 errors. */
   handleElicitation?: ToolUseContext['handleElicitation']
+  // Whether to include partial/in-progress messages in the output stream.
   includePartialMessages?: boolean
+  // Callback to report SDK status changes (e.g. 'thinking', 'tool_use').
   setSDKStatus?: (status: SDKStatus) => void
+  // External abort controller for cancellation. Defaults to a new one if not provided.
   abortController?: AbortController
+  // Permission that was granted but not yet consumed (from a previous session).
   orphanedPermission?: OrphanedPermission
   /**
    * Snip-boundary handler: receives each yielded system message plus the
@@ -182,12 +231,21 @@ export type QueryEngineConfig = {
  * persists across turns.
  */
 export class QueryEngine {
+  // The full configuration provided at construction time. Immutable after construction.
   private config: QueryEngineConfig
+  // The growing message history for this conversation. Persists across turns
+  // and is the source of truth for transcript recording and query input.
   private mutableMessages: Message[]
+  // Abort controller for cancelling the current turn. May be externally provided.
   private abortController: AbortController
+  // Tracks all permission denials across all turns for SDK result reporting.
   private permissionDenials: SDKPermissionDenial[]
+  // Cumulative token usage across all turns in this conversation.
   private totalUsage: NonNullableUsage
+  // Ensures orphaned permission handling runs at most once per engine lifetime.
   private hasHandledOrphanedPermission = false
+  // Cache of file contents read/written during this conversation.
+  // Used for diff detection and duplicate memory attachment filtering.
   private readFileState: FileStateCache
   // Turn-scoped skill discovery tracking (feeds was_discovered on
   // tengu_skill_tool_invocation). Must persist across the two
@@ -195,8 +253,13 @@ export class QueryEngine {
   // at the start of each submitMessage to avoid unbounded growth across
   // many turns in SDK mode.
   private discoveredSkillNames = new Set<string>()
+  // Tracks nested memory file paths already loaded to avoid re-loading.
   private loadedNestedMemoryPaths = new Set<string>()
 
+  // Constructor: initialize all per-conversation state from the config.
+  // - mutableMessages: seeded from initialMessages (e.g. --resume) or empty
+  // - abortController: from config or a fresh one (for cancellation support)
+  // - permissionDenials/totalUsage: start empty, accumulate across turns
   constructor(config: QueryEngineConfig) {
     this.config = config
     this.mutableMessages = config.initialMessages ?? []
@@ -206,6 +269,21 @@ export class QueryEngine {
     this.totalUsage = EMPTY_USAGE
   }
 
+  // submitMessage() — The primary public method. Starts a new turn in the conversation.
+  //
+  // This is an AsyncGenerator that yields SDKMessage events to the caller:
+  //   1. Processes user input (slash commands, attachments, model override)
+  //   2. Builds the system prompt and user/system context
+  //   3. Calls query() which runs the main conversation loop (query.ts)
+  //   4. Consumes query()'s yielded messages, recording transcripts and
+  //      normalizing to SDK format (SDKAssistantMessage, SDKUserMessageReplay, etc.)
+  //   5. Tracks usage, cost, and permission denials
+  //   6. Yields a final 'result' message with aggregate stats
+  //
+  // Parameters:
+  //   - prompt: the user's text input or structured content blocks
+  //   - options.uuid: optional message UUID (for dedup/resume)
+  //   - options.isMeta: whether this is a synthetic/meta message (not user-authored)
   async *submitMessage(
     prompt: string | ContentBlockParam[],
     options?: { uuid?: string; isMeta?: boolean },
@@ -240,7 +318,10 @@ export class QueryEngine {
     const persistSession = !isSessionPersistenceDisabled()
     const startTime = Date.now()
 
-    // Wrap canUseTool to track permission denials
+    // Wrap canUseTool to track permission denials for SDK result reporting.
+    // Every tool invocation passes through this wrapper. If the permission check
+    // returns anything other than 'allow', the denial is recorded in
+    // this.permissionDenials, which is included in the final 'result' message.
     const wrappedCanUseTool: CanUseToolFn = async (
       tool,
       input,

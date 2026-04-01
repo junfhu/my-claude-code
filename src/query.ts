@@ -1,3 +1,17 @@
+// query.ts — The core LLM conversation loop.
+//
+// This module implements the main agentic loop that drives a Claude conversation:
+//   1. Normalize messages and apply context management (snip, microcompact, collapse, autocompact)
+//   2. Send messages to the API and stream the response
+//   3. Execute tool calls (potentially overlapped with streaming)
+//   4. Collect tool results, attachments, and memory prefetches
+//   5. Check termination conditions (abort, max turns, stop hooks, token budget)
+//   6. If the model requested tool_use, loop back to step 1 with updated messages
+//
+// The loop is implemented as an AsyncGenerator that yields messages/events to the
+// caller (QueryEngine, ask(), or tests). Terminal/Continue transitions (see
+// transitions.ts) make exit/continue reasons explicit for testing and analytics.
+//
 // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
 import type {
   ToolResultBlockParam,
@@ -120,6 +134,18 @@ const taskSummaryModule = feature('BG_SESSIONS')
   : null
 /* eslint-enable @typescript-eslint/no-require-imports */
 
+// yieldMissingToolResultBlocks — Safety net for orphaned tool_use blocks.
+//
+// The Anthropic API requires every tool_use block to have a matching tool_result
+// in the next user message. If the streaming loop exits early (error, fallback,
+// abort), some tool_use blocks may not have results yet. This generator yields
+// synthetic error tool_result messages for each orphaned tool_use, preventing
+// API validation errors on subsequent turns.
+//
+// Called in three scenarios:
+//   1. Model fallback triggered (FallbackTriggeredError) — old tool_use IDs are invalid
+//   2. Unexpected throw from the streaming API — partial response may have tool_use blocks
+//   3. Streaming abort (Ctrl+C) when StreamingToolExecutor is NOT active
 function* yieldMissingToolResultBlocks(
   assistantMessages: AssistantMessage[],
   errorMessage: string,
@@ -161,6 +187,10 @@ function* yieldMissingToolResultBlocks(
  * the rules of thinking are the rules of the universe. If ye does not heed these
  * rules, ye will be punished with an entire day of debugging and hair pulling.
  */
+// Maximum number of multi-turn recovery attempts when the model hits
+// max_output_tokens. Each recovery injects a synthetic "resume" user message
+// asking the model to continue. After this many attempts, the withheld error
+// is surfaced and the loop terminates.
 const MAX_OUTPUT_TOKENS_RECOVERY_LIMIT = 3
 
 /**
@@ -178,44 +208,89 @@ function isWithheldMaxOutputTokens(
   return msg?.type === 'assistant' && msg.apiError === 'max_output_tokens'
 }
 
+// QueryParams — all inputs needed to start a query loop.
+// Immutable for the duration of the loop (destructured at the top of queryLoop).
+// The caller (QueryEngine.submitMessage, ask(), or tests) builds this once.
 export type QueryParams = {
+  // The full message history to send to the API (post-compact boundary applied).
   messages: Message[]
+  // The system prompt parts (default + custom + append).
   systemPrompt: SystemPrompt
+  // User context key-value pairs prepended to the first user message
+  // (e.g. cwd, platform, date). See prependUserContext().
   userContext: { [k: string]: string }
+  // System context key-value pairs appended to the system prompt
+  // (e.g. tool descriptions, MCP context).
   systemContext: { [k: string]: string }
+  // Permission-checking function: called before each tool execution to
+  // determine allow/deny/ask. Wraps the raw canUseTool with SDK denial tracking.
   canUseTool: CanUseToolFn
+  // Mutable context bag carried through the loop. Contains tools, options,
+  // abort controller, file state, app state accessors, and agent metadata.
   toolUseContext: ToolUseContext
+  // Optional fallback model to switch to on FallbackTriggeredError (high demand).
   fallbackModel?: string
+  // Identifies the caller context for analytics and behavior branching
+  // (e.g. 'sdk', 'repl_main_thread', 'agent:<id>', 'compact').
   querySource: QuerySource
+  // Override for max output tokens (used by escalation recovery).
   maxOutputTokensOverride?: number
+  // Maximum number of tool-use turns before the loop force-stops.
   maxTurns?: number
+  // Skip writing to the prompt cache (used for ephemeral forked queries).
   skipCacheWrite?: boolean
   // API task_budget (output_config.task_budget, beta task-budgets-2026-03-13).
   // Distinct from the tokenBudget +500k auto-continue feature. `total` is the
   // budget for the whole agentic turn; `remaining` is computed per iteration
   // from cumulative API usage. See configureTaskBudgetParams in claude.ts.
   taskBudget?: { total: number }
+  // Dependency injection for testability. Defaults to productionDeps().
   deps?: QueryDeps
 }
 
 // -- query loop state
 
-// Mutable state carried between loop iterations
+// Mutable state carried between loop iterations.
+// Each continue site builds a new State object (`state = { ... }`) rather
+// than mutating individual fields, making transitions atomic and debuggable.
+// The loop body destructures `state` at the top of each iteration.
 type State = {
+  // The full message array (post-compact). Grows each iteration as assistant
+  // messages and tool results are appended.
   messages: Message[]
+  // Mutable context bag: tools, options, abort controller, file state, etc.
+  // Reassigned within iterations when queryTracking or tool context updates.
   toolUseContext: ToolUseContext
+  // Tracks whether autocompact has fired and how many turns since.
+  // Used by the autocompact threshold check to decide when to compact again.
   autoCompactTracking: AutoCompactTrackingState | undefined
+  // How many times we've retried after hitting max_output_tokens this turn.
+  // Resets to 0 on successful tool-use continuations.
   maxOutputTokensRecoveryCount: number
+  // Whether reactive compact has already been attempted this turn.
+  // Prevents infinite compact→413→compact loops.
   hasAttemptedReactiveCompact: boolean
+  // Override for max output tokens, set by the escalation recovery path
+  // (e.g. 8k→64k). Cleared on non-escalation continue sites.
   maxOutputTokensOverride: number | undefined
+  // A background Haiku call generating a natural-language tool use summary.
+  // Resolved between iterations to overlap with the next API call.
   pendingToolUseSummary: Promise<ToolUseSummaryMessage | null> | undefined
+  // Whether a stop hook is actively blocking — when true, the next iteration
+  // skips re-running stop hooks to avoid duplicate evaluation.
   stopHookActive: boolean | undefined
+  // 1-based turn counter incremented each time tool results are sent back.
+  // Compared against maxTurns to enforce the turn limit.
   turnCount: number
   // Why the previous iteration continued. Undefined on first iteration.
   // Lets tests assert recovery paths fired without inspecting message contents.
   transition: Continue | undefined
 }
 
+// query() — Public entry point for the conversation loop.
+// Wraps queryLoop() to handle command lifecycle notifications. Commands consumed
+// as mid-turn attachments are tracked in consumedCommandUuids and notified as
+// 'completed' only if the loop returns normally (not on throw or .return()).
 export async function* query(
   params: QueryParams,
 ): AsyncGenerator<
@@ -238,6 +313,46 @@ export async function* query(
   return terminal
 }
 
+// queryLoop() — The main while(true) conversation loop.
+//
+// Each iteration performs one full round-trip with the API:
+//   PHASE 1 — Context Management (lines ~365-547):
+//     a. Apply tool result budgeting (applyToolResultBudget)
+//     b. Apply snip compaction (HISTORY_SNIP feature)
+//     c. Apply microcompact (cached/inline tool result compression)
+//     d. Apply context collapse (CONTEXT_COLLAPSE feature)
+//     e. Run autocompact if token threshold exceeded
+//
+//   PHASE 2 — API Call & Streaming (lines ~560-863):
+//     a. Check blocking limit (token count gate)
+//     b. Stream response from deps.callModel()
+//     c. During streaming: backfill tool inputs, withhold recoverable errors,
+//        feed tool_use blocks to StreamingToolExecutor
+//     d. Handle model fallback on FallbackTriggeredError
+//
+//   PHASE 3 — Post-Streaming Processing (lines ~999-1060):
+//     a. Execute post-sampling hooks
+//     b. Handle streaming abort (Ctrl+C)
+//     c. Yield pending tool use summary from previous iteration
+//
+//   PHASE 4 — Error Recovery (lines ~1062-1256):
+//     a. If no tool_use (needsFollowUp=false):
+//        - Recover from 413 via collapse drain → reactive compact
+//        - Recover from max_output_tokens via escalation → multi-turn recovery
+//        - Run stop hooks → may block and continue
+//        - Check token budget for auto-continuation
+//        - Return Terminal 'completed'
+//
+//   PHASE 5 — Tool Execution (lines ~1360-1408):
+//     a. Run remaining tools (streaming executor or batch runTools)
+//     b. Collect tool results and updated context
+//
+//   PHASE 6 — Attachments & Continuation (lines ~1536-1728):
+//     a. Drain queued commands as attachments
+//     b. Consume memory prefetch and skill discovery results
+//     c. Refresh tools (MCP server connections may have changed)
+//     d. Check maxTurns limit
+//     e. Build next State and continue
 async function* queryLoop(
   params: QueryParams,
   consumedCommandUuids: string[],
@@ -265,6 +380,8 @@ async function* queryLoop(
   // Mutable cross-iteration state. The loop body destructures this at the top
   // of each iteration so reads stay bare-name (`messages`, `toolUseContext`).
   // Continue sites write `state = { ... }` instead of 9 separate assignments.
+  // Initial values: first iteration uses params.messages directly, no prior
+  // compaction, no recovery attempts, turn 1, no previous transition.
   let state: State = {
     messages: params.messages,
     toolUseContext: params.toolUseContext,
@@ -277,6 +394,9 @@ async function* queryLoop(
     pendingToolUseSummary: undefined,
     transition: undefined,
   }
+  // Token budget tracker for the auto-continue feature (TOKEN_BUDGET gate).
+  // Tracks cumulative output tokens across iterations and decides whether to
+  // inject a "keep going" nudge or stop. Null when the feature is disabled.
   const budgetTracker = feature('TOKEN_BUDGET') ? createBudgetTracker() : null
 
   // task_budget.remaining tracking across compaction boundaries. Undefined
@@ -305,6 +425,10 @@ async function* queryLoop(
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
+    // =========================================================================
+    // PHASE 1: Context Management — normalize messages before sending to API
+    // =========================================================================
+
     // Destructure state at the top of each iteration. toolUseContext alone
     // is reassigned within an iteration (queryTracking, messages updates);
     // the rest are read-only between continue sites.
@@ -362,6 +486,10 @@ async function* queryLoop(
       queryTracking,
     }
 
+    // Clone messages after the compact boundary. Messages before the boundary
+    // have been summarized and are no longer needed for the API call.
+    // This is the working copy that gets progressively transformed by each
+    // context management step below (budget → snip → microcompact → collapse → autocompact).
     let messagesForQuery = [...getMessagesAfterCompactBoundary(messages)]
 
     let tracking = autoCompactTracking
@@ -548,16 +676,26 @@ async function* queryLoop(
       messages: messagesForQuery,
     }
 
+    // Accumulates all assistant messages from this iteration's API response.
+    // May contain multiple messages if the API yields per-block (streaming).
     const assistantMessages: AssistantMessage[] = []
+    // Accumulates tool_result user messages and attachment messages from this iteration.
     const toolResults: (UserMessage | AttachmentMessage)[] = []
     // @see https://docs.claude.com/en/docs/build-with-claude/tool-use
     // Note: stop_reason === 'tool_use' is unreliable -- it's not always set correctly.
     // Set during streaming whenever a tool_use block arrives — the sole
     // loop-exit signal. If false after streaming, we're done (modulo stop-hook retry).
+    // Collects all tool_use blocks from the model response for execution.
     const toolUseBlocks: ToolUseBlock[] = []
+    // Flipped to true when any tool_use block is found. Controls whether the
+    // loop proceeds to tool execution (Phase 5) or termination checks (Phase 4).
     let needsFollowUp = false
 
     queryCheckpoint('query_setup_start')
+    // Instantiate the streaming tool executor if the gate is enabled.
+    // When active, tools begin execution as soon as their tool_use block
+    // arrives from the stream (overlapping with the rest of the response),
+    // rather than waiting for the full response to complete.
     const useStreamingToolExecution = config.gates.streamingToolExecution
     let streamingToolExecutor = useStreamingToolExecution
       ? new StreamingToolExecutor(
@@ -567,6 +705,8 @@ async function* queryLoop(
         )
       : null
 
+    // Determine the model for this iteration. In 'plan' permission mode with
+    // very large contexts (>200k tokens), a different model may be selected.
     const appState = toolUseContext.getAppState()
     const permissionMode = appState.toolPermissionContext.mode
     let currentModel = getRuntimeMainLoopModel({
@@ -647,6 +787,13 @@ async function* queryLoop(
       }
     }
 
+    // =========================================================================
+    // PHASE 2: API Call & Streaming — send messages and stream the response
+    // =========================================================================
+
+    // attemptWithFallback: a simple retry-once mechanism for model fallback.
+    // On FallbackTriggeredError, the loop switches to the fallback model,
+    // clears accumulated state, and retries. Only one fallback attempt is made.
     let attemptWithFallback = true
 
     queryCheckpoint('query_api_loop_start')
@@ -656,6 +803,19 @@ async function* queryLoop(
         try {
           let streamingFallbackOccured = false
           queryCheckpoint('query_api_streaming_start')
+          // ---------------------------------------------------------------
+          // Main streaming loop: iterate over messages yielded by the API.
+          // Each `message` is either an AssistantMessage (content block),
+          // a StreamEvent (message_start/delta), or a system message.
+          //
+          // Key behaviors during streaming:
+          //   - Backfill observable tool inputs (for SDK/transcript visibility)
+          //   - Withhold recoverable errors (413, max_output_tokens, media errors)
+          //     so recovery paths can handle them after streaming completes
+          //   - Feed tool_use blocks to StreamingToolExecutor for parallel execution
+          //   - Yield completed streaming tool results immediately
+          //   - Handle streaming fallback (clear state, restart with new model)
+          // ---------------------------------------------------------------
           for await (const message of deps.callModel({
             messages: prependUserContext(messagesForQuery, userContext),
             systemPrompt: fullSystemPrompt,
@@ -706,6 +866,9 @@ async function* queryLoop(
               }),
             },
           })) {
+            // ----- Streaming fallback recovery -----
+            // If a streaming fallback occurred (mid-stream model switch),
+            // discard all accumulated state from the failed attempt.
             // We won't use the tool_calls from the first attempt
             // We could.. but then we'd have to merge assistant messages
             // with different ids and double up on full the tool_results
@@ -824,8 +987,13 @@ async function* queryLoop(
               yield yieldMessage
             }
             if (message.type === 'assistant') {
+              // Track this assistant message for later tool result matching
+              // and recovery (yieldMissingToolResultBlocks).
               assistantMessages.push(message)
 
+              // Extract tool_use blocks from this assistant message.
+              // If any are found, set needsFollowUp=true to enter tool execution
+              // after streaming, and feed them to StreamingToolExecutor (if active).
               const msgToolUseBlocks = message.message.content.filter(
                 content => content.type === 'tool_use',
               ) as ToolUseBlock[]
@@ -844,6 +1012,11 @@ async function* queryLoop(
               }
             }
 
+            // ----- Streaming tool execution: yield completed results -----
+            // While the model is still streaming, check if any tools that were
+            // started earlier (via StreamingToolExecutor) have completed.
+            // Yielding results here overlaps tool execution with streaming,
+            // reducing total latency for multi-tool responses.
             if (
               streamingToolExecutor &&
               !toolUseContext.abortController.signal.aborted
@@ -996,7 +1169,14 @@ async function* queryLoop(
       return { reason: 'model_error', error }
     }
 
-    // Execute post-sampling hooks after model response is complete
+    // =========================================================================
+    // PHASE 3: Post-Streaming — hooks, abort handling, summary resolution
+    // =========================================================================
+
+    // Execute post-sampling hooks after model response is complete.
+    // These are fire-and-forget (void) — they run in the background and do not
+    // block the next phase. Post-sampling hooks can inspect the full conversation
+    // including the model's latest response for observability/policy purposes.
     if (assistantMessages.length > 0) {
       void executePostSamplingHooks(
         [...messagesForQuery, ...assistantMessages],
@@ -1058,6 +1238,12 @@ async function* queryLoop(
         yield summary
       }
     }
+
+    // =========================================================================
+    // PHASE 4: Error Recovery & Termination — handle no-tool-use completions
+    // =========================================================================
+    // If the model did NOT request any tool_use, we check for recoverable errors,
+    // run stop hooks, check token budget, and potentially return Terminal.
 
     if (!needsFollowUp) {
       const lastMessage = assistantMessages.at(-1)
@@ -1357,6 +1543,10 @@ async function* queryLoop(
       return { reason: 'completed' }
     }
 
+    // =========================================================================
+    // PHASE 5: Tool Execution — run remaining/batch tools and collect results
+    // =========================================================================
+
     let shouldPreventContinuation = false
     let updatedToolUseContext = toolUseContext
 
@@ -1377,10 +1567,16 @@ async function* queryLoop(
       })
     }
 
+    // Choose tool execution strategy:
+    // - StreamingToolExecutor: tools already started during streaming; drain remaining results
+    // - runTools (batch): execute all tool_use blocks sequentially after streaming completes
     const toolUpdates = streamingToolExecutor
       ? streamingToolExecutor.getRemainingResults()
       : runTools(toolUseBlocks, assistantMessages, canUseTool, toolUseContext)
 
+    // Iterate over tool execution results. Each update may contain:
+    //   - update.message: the tool result or attachment to yield and track
+    //   - update.newContext: an updated ToolUseContext (e.g. after file state changes)
     for await (const update of toolUpdates) {
       if (update.message) {
         yield update.message
@@ -1408,7 +1604,11 @@ async function* queryLoop(
     }
     queryCheckpoint('query_tool_execution_end')
 
-    // Generate tool use summary after tool batch completes — passed to next recursive call
+    // Generate tool use summary after tool batch completes — passed to next recursive call.
+    // This fires a lightweight Haiku call in the background to produce a human-readable
+    // summary like "Read 3 files and edited 2". The promise is stored in
+    // nextPendingToolUseSummary and resolved at the START of the next iteration
+    // (before Phase 2), overlapping with model streaming time.
     let nextPendingToolUseSummary:
       | Promise<ToolUseSummaryMessage | null>
       | undefined
@@ -1531,6 +1731,10 @@ async function* queryLoop(
         queryDepth: queryTracking.depth,
       })
     }
+
+    // =========================================================================
+    // PHASE 6: Attachments & Continuation — gather context for next iteration
+    // =========================================================================
 
     // Be careful to do this after tool calls are done, because the API
     // will error if we interleave tool_result messages with regular user messages.
@@ -1656,7 +1860,9 @@ async function* queryLoop(
       queryDepth: queryTracking.depth,
     })
 
-    // Refresh tools between turns so newly-connected MCP servers become available
+    // Refresh tools between turns so newly-connected MCP servers become available.
+    // This is needed because MCP server connections may be established
+    // asynchronously during tool execution (e.g. a tool installs an MCP server).
     if (updatedToolUseContext.options.refreshTools) {
       const refreshedTools = updatedToolUseContext.options.refreshTools()
       if (refreshedTools !== updatedToolUseContext.options.tools) {
@@ -1711,6 +1917,12 @@ async function* queryLoop(
       return { reason: 'max_turns', turnCount: nextTurnCount }
     }
 
+    // ---------------------------------------------------------------
+    // CONTINUE: Build next State and loop back to Phase 1.
+    // Messages grow by appending this iteration's assistant messages and
+    // tool results. Recovery counters reset (maxOutputTokensRecoveryCount,
+    // hasAttemptedReactiveCompact) since this is a successful tool-use turn.
+    // ---------------------------------------------------------------
     queryCheckpoint('query_recursive_call')
     const next: State = {
       messages: [...messagesForQuery, ...assistantMessages, ...toolResults],

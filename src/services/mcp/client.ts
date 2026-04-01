@@ -1,10 +1,45 @@
+// =============================================================================
+// MCP (Model Context Protocol) Client
+// =============================================================================
+// This is the core MCP client module responsible for:
+//
+//   1. Server lifecycle management — connecting to MCP servers, maintaining
+//      persistent sessions, handling reconnections on session expiry.
+//
+//   2. Transport negotiation — supports five transport types:
+//      - stdio:  Spawns a child process and communicates via stdin/stdout
+//      - SSE:    Server-Sent Events over HTTP (legacy MCP transport)
+//      - WebSocket: Full-duplex WebSocket connections
+//      - HTTP:   Streamable HTTP (newer MCP transport, replaces SSE)
+//      - SDK:    In-process SDK control transport (for embedded servers)
+//
+//   3. Tool discovery — queries each connected server's tool list, wraps them
+//      as MCPTool instances, and exposes them to the agent's tool registry.
+//
+//   4. Authentication flows — supports OAuth 2.0 for remote MCP servers
+//      (via ClaudeAuthProvider), token refresh, step-up auth detection,
+//      and caching of auth-needed state to avoid redundant 401 retries.
+//
+//   5. Resource management — lists and reads server-exposed resources,
+//      handles binary content persistence and image resizing.
+//
+// The module uses a connection cache (memoized by server name) to ensure
+// only one active connection per server at any time.
+// =============================================================================
+
 import { feature } from 'bun:bundle'
+// Anthropic SDK types used to convert MCP tool results into API-compatible
+// content blocks (images, text, etc.) for the messages API.
 import type {
   Base64ImageSource,
   ContentBlockParam,
   MessageParam,
 } from '@anthropic-ai/sdk/resources/index.mjs'
+// The official MCP SDK client — handles JSON-RPC framing, capability
+// negotiation, and request/response correlation over any transport.
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+// Transport implementations — each handles a different wire protocol:
+// SSE (Server-Sent Events), stdio (child process), HTTP (streamable), WebSocket
 import {
   SSEClientTransport,
   type SSEClientTransportOptions,
@@ -19,6 +54,8 @@ import {
   type FetchLike,
   type Transport,
 } from '@modelcontextprotocol/sdk/shared/transport.js'
+// MCP protocol schema types — defines the JSON-RPC message shapes for tool
+// calls, resource listing, prompt listing, elicitation, etc.
 import {
   CallToolResultSchema,
   ElicitRequestSchema,
@@ -36,31 +73,37 @@ import {
   type PromptMessage,
   type ResourceLink,
 } from '@modelcontextprotocol/sdk/types.js'
+// Lodash utilities for data transformation
 import mapValues from 'lodash-es/mapValues.js'
 import memoize from 'lodash-es/memoize.js'
 import zipObject from 'lodash-es/zipObject.js'
+// p-map provides concurrency-limited parallel mapping (used for batch server connections)
 import pMap from 'p-map'
 import { getOriginalCwd, getSessionId } from '../../bootstrap/state.js'
 import type { Command } from '../../commands.js'
 import { getOauthConfig } from '../../constants/oauth.js'
 import { PRODUCT_URL } from '../../constants/product.js'
 import type { AppState } from '../../state/AppState.js'
+// Tool system types — MCPTool wraps MCP server tools into the internal Tool interface
 import {
   type Tool,
   type ToolCallProgress,
   toolMatchesName,
 } from '../../Tool.js'
+// MCP-specific tool implementations for resource listing and reading
 import { ListMcpResourcesTool } from '../../tools/ListMcpResourcesTool/ListMcpResourcesTool.js'
 import { type MCPProgress, MCPTool } from '../../tools/MCPTool/MCPTool.js'
 import { createMcpAuthTool } from '../../tools/McpAuthTool/McpAuthTool.js'
 import { ReadMcpResourceTool } from '../../tools/ReadMcpResourceTool/ReadMcpResourceTool.js'
 import { createAbortController } from '../../utils/abortController.js'
 import { count } from '../../utils/array.js'
+// Auth utilities — OAuth token management and 401 error handling
 import {
   checkAndRefreshOAuthTokenIfNeeded,
   getClaudeAIOAuthTokens,
   handleOAuth401Error,
 } from '../../utils/auth.js'
+// Cleanup registry — ensures MCP server connections are properly torn down on exit
 import { registerCleanup } from '../../utils/cleanupRegistry.js'
 import { detectCodeIndexingFromMcpServerName } from '../../utils/codeIndexing.js'
 import { logForDebugging } from '../../utils/debug.js'
@@ -73,21 +116,25 @@ import { getMCPUserAgent } from '../../utils/http.js'
 import { maybeNotifyIDEConnected } from '../../utils/ide.js'
 import { maybeResizeAndDownsampleImageBuffer } from '../../utils/imageResizer.js'
 import { logMCPDebug, logMCPError } from '../../utils/log.js'
+// Output storage — handles persisting large binary/text results from MCP tools to disk
 import {
   getBinaryBlobSavedMessage,
   getFormatDescription,
   getLargeOutputInstructions,
   persistBinaryContent,
 } from '../../utils/mcpOutputStorage.js'
+// MCP validation — content size estimation and truncation for large tool results
 import {
   getContentSizeEstimate,
   type MCPToolResult,
   mcpContentNeedsTruncation,
   truncateMcpContentIfNeeded,
 } from '../../utils/mcpValidation.js'
+// WebSocket transport — custom implementation supporting proxy and mTLS
 import { WebSocketTransport } from '../../utils/mcpWebSocketTransport.js'
 import { memoizeWithLRU } from '../../utils/memoize.js'
 import { getWebSocketTLSOptions } from '../../utils/mtls.js'
+// Proxy support — ensures MCP HTTP/WebSocket connections respect proxy settings
 import {
   getProxyFetchOptions,
   getWebSocketProxyAgent,
@@ -104,6 +151,8 @@ import {
   type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
   logEvent,
 } from '../analytics/index.js'
+// Elicitation — allows MCP servers to prompt the user for additional input
+// during tool execution (e.g. "which file did you mean?")
 import {
   type ElicitationWaitingState,
   runElicitationHooks,
@@ -113,7 +162,11 @@ import { buildMcpToolName } from './mcpStringUtils.js'
 import { normalizeNameForMCP } from './normalization.js'
 import { getLoggingSafeMcpBaseUrl } from './utils.js'
 
+// Feature-gated imports — these are conditionally loaded based on build-time
+// feature flags (bun:bundle features). This ensures heavy dependencies are
+// tree-shaken away when not needed.
 /* eslint-disable @typescript-eslint/no-require-imports */
+// MCP Skills: Fetches skill definitions from MCP servers (only in MCP_SKILLS builds)
 const fetchMcpSkillsForClient = feature('MCP_SKILLS')
   ? (
       require('../../skills/mcpSkills.js') as typeof import('../../skills/mcpSkills.js')
@@ -123,18 +176,28 @@ const fetchMcpSkillsForClient = feature('MCP_SKILLS')
 import { UnauthorizedError } from '@modelcontextprotocol/sdk/client/auth.js'
 import type { AssistantMessage } from 'src/types/message.js'
 /* eslint-enable @typescript-eslint/no-require-imports */
+// Tool collapse classification — determines how MCP tool results are
+// displayed in the UI (collapsed, expanded, or hidden)
 import { classifyMcpToolForCollapse } from '../../tools/MCPTool/classifyForCollapse.js'
 import { clearKeychainCache } from '../../utils/secureStorage/macOsKeychainHelpers.js'
 import { sleep } from '../../utils/sleep.js'
+// Auth providers for MCP OAuth flow — ClaudeAuthProvider handles the OAuth
+// dance, hasMcpDiscoveryButNoToken detects servers needing auth,
+// wrapFetchWithStepUpDetection detects when a server requires elevated permissions.
 import {
   ClaudeAuthProvider,
   hasMcpDiscoveryButNoToken,
   wrapFetchWithStepUpDetection,
 } from './auth.js'
 import { markClaudeAiMcpConnected } from './claudeai.js'
+// Config loading — reads MCP server definitions from settings.json,
+// CLAUDE.md files, and CLI flags to determine which servers to connect.
 import { getAllMcpConfigs, isMcpServerDisabled } from './config.js'
+// Custom header injection for MCP HTTP requests (from server config)
 import { getMcpServerHeaders } from './headersHelper.js'
+// SDK control transport — for in-process embedded MCP servers
 import { SdkControlClientTransport } from './SdkControlTransport.js'
+// Type definitions for MCP server connections and configuration
 import type {
   ConnectedMCPServer,
   MCPServerConnection,
@@ -142,6 +205,15 @@ import type {
   ScopedMcpServerConfig,
   ServerResource,
 } from './types.js'
+
+// =============================================================================
+// Error Classes for MCP Session and Tool Call Failures
+// =============================================================================
+// These error types enable structured error handling at the tool execution
+// layer. Each triggers a specific recovery strategy:
+//   - McpAuthError → marks server as 'needs-auth', presents auth tool to user
+//   - McpSessionExpiredError → clears connection cache, retries with fresh client
+//   - McpToolCallError → propagates the error with _meta for SDK consumers
 
 /**
  * Custom error class to indicate that an MCP tool call failed due to
@@ -205,9 +277,17 @@ export function isMcpSessionExpiredError(error: Error): boolean {
   )
 }
 
+// =============================================================================
+// Constants — Timeouts and Limits
+// =============================================================================
+
 /**
  * Default timeout for MCP tool calls (effectively infinite - ~27.8 hours).
  */
+// This very large timeout is intentional: MCP tools can be long-running
+// operations (e.g. code indexing, large file processing). The practical
+// timeout is controlled by the MCP_TOOL_TIMEOUT env var for users who
+// need a stricter limit.
 const DEFAULT_MCP_TOOL_TIMEOUT_MS = 100_000_000
 
 /**
@@ -228,7 +308,15 @@ function getMcpToolTimeoutMs(): number {
   )
 }
 
+// Claude-in-Chrome detection — identifies if an MCP server is the Chrome extension bridge
 import { isClaudeInChromeMCPServer } from '../../utils/claudeInChrome/common.js'
+
+// =============================================================================
+// Lazy-loaded modules for specialized MCP server types
+// =============================================================================
+// These modules are loaded on-demand (via require()) to avoid pulling heavy
+// native dependencies (React/Ink, native input modules) into the main bundle
+// when they're not needed. Each is gated by a feature flag or server type check.
 
 // Lazy: toolRendering.tsx pulls React/ink; only needed when Claude-in-Chrome MCP server is connected
 /* eslint-disable @typescript-eslint/no-require-imports */
@@ -254,20 +342,48 @@ import { getClaudeConfigHomeDir } from '../../utils/envUtils.js'
 /* eslint-enable @typescript-eslint/no-require-imports */
 import { jsonParse, jsonStringify } from '../../utils/slowOperations.js'
 
+// =============================================================================
+// MCP Auth Cache — Persists "needs-auth" state to disk
+// =============================================================================
+// When an MCP server returns a 401 (Unauthorized), we cache that fact on disk
+// so subsequent connection attempts within the TTL window skip the connect
+// attempt and immediately present the auth tool to the user. This avoids
+// redundant network round-trips and 401 error noise.
+//
+// The cache is a simple JSON file mapping server IDs to timestamps:
+//   { "server-name": { "timestamp": 1234567890 } }
+//
+// Key design decisions:
+//   - 15-minute TTL: short enough that token refreshes take effect quickly
+//   - File-based: survives process restarts (important for session resume)
+//   - Memoized reads: N concurrent isMcpAuthCached() calls share one read
+//   - Serialized writes: promise chain prevents read-modify-write races
+
+// TTL for auth cache entries — after 15 minutes, we retry the connection
+// in case the user has completed the OAuth flow or the token has been refreshed.
 const MCP_AUTH_CACHE_TTL_MS = 15 * 60 * 1000 // 15 min
 
+// Type for the on-disk auth cache structure
 type McpAuthCacheData = Record<string, { timestamp: number }>
 
+// Returns the file path for the auth cache JSON file, stored in the Claude config home directory
 function getMcpAuthCachePath(): string {
   return join(getClaudeConfigHomeDir(), 'mcp-needs-auth-cache.json')
 }
 
+// In-memory promise for the current cache read. This acts as a single-flight
+// gate: when multiple isMcpAuthCached() calls arrive simultaneously during
+// batch server connection, they all await the same file read promise instead
+// of issuing N redundant reads. Invalidated on write (setMcpAuthCacheEntry)
+// and clear (clearMcpAuthCache) so subsequent reads pick up fresh data.
 // Memoized so N concurrent isMcpAuthCached() calls during batched connection
 // share a single file read instead of N reads of the same file. Invalidated
 // on write (setMcpAuthCacheEntry) and clear (clearMcpAuthCache). Not using
 // lodash memoize because we need to null out the cache, not delete by key.
 let authCachePromise: Promise<McpAuthCacheData> | null = null
 
+// Reads the auth cache from disk (or returns the in-flight promise).
+// On any read error (file not found, corrupt JSON), returns an empty object.
 function getMcpAuthCache(): Promise<McpAuthCacheData> {
   if (!authCachePromise) {
     authCachePromise = readFile(getMcpAuthCachePath(), 'utf-8')
@@ -277,6 +393,8 @@ function getMcpAuthCache(): Promise<McpAuthCacheData> {
   return authCachePromise
 }
 
+// Checks whether a given server ID has a valid (non-expired) auth cache entry.
+// Returns true if the server was recently marked as needing auth (within TTL).
 async function isMcpAuthCached(serverId: string): Promise<boolean> {
   const cache = await getMcpAuthCache()
   const entry = cache[serverId]
@@ -286,10 +404,16 @@ async function isMcpAuthCached(serverId: string): Promise<boolean> {
   return Date.now() - entry.timestamp < MCP_AUTH_CACHE_TTL_MS
 }
 
+// Write serialization chain — ensures that concurrent setMcpAuthCacheEntry()
+// calls (e.g. when multiple servers return 401 in the same batch) don't
+// corrupt the cache file via concurrent read-modify-write operations.
+// Each write waits for the previous write to complete before proceeding.
 // Serialize cache writes through a promise chain to prevent concurrent
 // read-modify-write races when multiple servers return 401 in the same batch
 let writeChain = Promise.resolve()
 
+// Records that a server needs auth by writing its timestamp to the cache file.
+// This is a fire-and-forget operation (errors are silently swallowed).
 function setMcpAuthCacheEntry(serverId: string): void {
   writeChain = writeChain
     .then(async () => {

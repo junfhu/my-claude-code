@@ -1,42 +1,107 @@
+// =============================================================================
+// ink.tsx — Core Ink Terminal Renderer
+// =============================================================================
+// This is the heart of the terminal rendering engine. It bridges React's
+// virtual DOM reconciliation with actual terminal output via a custom
+// React reconciler (react-reconciler). The render pipeline works as follows:
+//
+//   1. React commits changes to a virtual DOM tree of `DOMElement` nodes
+//   2. The reconciler's `resetAfterCommit` calls `scheduleRender`
+//   3. `scheduleRender` is throttled (FRAME_INTERVAL_MS) and deferred via microtask
+//   4. `onRender()` runs the full render pipeline:
+//      a. Yoga layout calculates node positions/sizes for the terminal width
+//      b. `renderNodeToOutput()` walks the DOM tree and writes cells to a Screen buffer
+//      c. `writeDiffToTerminal()` diffs the new frame against the previous frame
+//         and writes only the changed cells to stdout (minimizing flicker)
+//
+// The class also manages:
+//   - Alt-screen mode (ENTER_ALT_SCREEN / EXIT_ALT_SCREEN) for fullscreen UI
+//   - Text selection state (mouse-driven selection in alt-screen)
+//   - Search highlighting (inverted colors on matching cells)
+//   - Cursor positioning (declared by components via useDeclaredCursor)
+//   - Double-buffering (frontFrame/backFrame) for efficient diff rendering
+//   - Console patching (intercepts console.log/error during rendering)
+//   - Pool-based memory management (StylePool, CharPool, HyperlinkPool)
+//   - Instance lifecycle (mount, pause, resume, unmount)
+//
+// Each Ink instance corresponds to one React tree rendered to one terminal.
+// The global `instances` map tracks all active instances by stdout stream.
+// =============================================================================
 import autoBind from 'auto-bind';
+// Low-level fs operations for synchronous terminal I/O
 import { closeSync, constants as fsConstants, openSync, readSync, writeSync } from 'fs';
 import noop from 'lodash-es/noop.js';
+// Throttle: limits scheduleRender to at most one call per FRAME_INTERVAL_MS
 import throttle from 'lodash-es/throttle.js';
 import React, { type ReactNode } from 'react';
+// FiberRoot is the internal React data structure for the reconciler's root container
 import type { FiberRoot } from 'react-reconciler';
+// ConcurrentRoot enables React 18 concurrent features (transitions, suspense)
 import { ConcurrentRoot } from 'react-reconciler/constants.js';
+// Registers a cleanup handler that runs when the process exits
 import { onExit } from 'signal-exit';
 import { flushInteractionTime } from 'src/bootstrap/state.js';
+// Yoga layout counters for performance profiling (nodes visited, cache hits, etc.)
 import { getYogaCounters } from 'src/native-ts/yoga-layout/index.js';
 import { logForDebugging } from 'src/utils/debug.js';
 import { logError } from 'src/utils/log.js';
 import { format } from 'util';
+// Applies ANSI color codes to text content
 import { colorize } from './colorize.js';
+// The Ink-internal App wrapper component (not to be confused with components/App.tsx)
 import App from './components/App.js';
+// Cursor declaration: allows components to declare where the terminal cursor should be
 import type { CursorDeclaration, CursorDeclarationSetter } from './components/CursorDeclarationContext.js';
+// Target frame interval in milliseconds (e.g., 16ms for ~60fps)
 import { FRAME_INTERVAL_MS } from './constants.js';
+// Virtual DOM implementation: DOMElement nodes that mirror terminal layout
 import * as dom from './dom.js';
+// Custom keyboard event class for dispatching key events through the Ink event system
 import { KeyboardEvent } from './events/keyboard-event.js';
+// Focus management: tracks which component has keyboard focus
 import { FocusManager } from './focus.js';
+// Frame: a snapshot of the rendered screen (cells + cursor position)
 import { emptyFrame, type Frame, type FrameEvent } from './frame.js';
+// Hit testing: dispatches mouse click and hover events to DOM elements
 import { dispatchClick, dispatchHover } from './hit-test.js';
+// Global map of Ink instances keyed by stdout stream
 import instances from './instances.js';
+// LogUpdate: manages incremental terminal output for non-alt-screen mode
 import { LogUpdate } from './log-update.js';
+// Node cache: caches Yoga node references for efficient layout access
 import { nodeCache } from './node-cache.js';
+// Optimizer: compresses/deduplicates terminal escape sequences
 import { optimize } from './optimizer.js';
+// Output: terminal output abstraction
 import Output from './output.js';
 import type { ParsedKey } from './parse-keypress.js';
+// React reconciler: the custom reconciler that bridges React to the terminal DOM.
+// Also exports layout profiling helpers and debug repaint flag.
 import reconciler, { dispatcher, getLastCommitMs, getLastYogaMs, isDebugRepaintsEnabled, recordYogaMs, resetProfileCounters } from './reconciler.js';
+// Walks the DOM tree and renders each node's content into the screen buffer
 import renderNodeToOutput, { consumeFollowScroll, didLayoutShift } from './render-node-to-output.js';
+// Applies position-based highlights (e.g., search result navigation) to the screen
 import { applyPositionedHighlight, type MatchPosition, scanPositions } from './render-to-screen.js';
+// Creates the renderer that transforms the DOM tree into a Frame
 import createRenderer, { type Renderer } from './renderer.js';
+// Screen buffer: a 2D grid of cells with character, style, and hyperlink pools.
+// Pools are used to deduplicate strings and reduce memory allocation pressure.
 import { CellWidth, CharPool, cellAt, createScreen, HyperlinkPool, isEmptyCellAt, migrateScreenPools, StylePool } from './screen.js';
+// Applies the search query highlight (inverts matching cell colors)
 import { applySearchHighlight } from './searchHighlight.js';
+// Selection system: tracks mouse-driven text selection for copy-to-clipboard.
+// Manages start/extend/clear of selection ranges and converts to plain text.
 import { applySelectionOverlay, captureScrolledRows, clearSelection, createSelectionState, extendSelection, type FocusMove, findPlainTextUrlAt, getSelectedText, hasSelection, moveFocus, type SelectionState, selectLineAt, selectWordAt, shiftAnchor, shiftSelection, shiftSelectionForFollow, startSelection, updateSelection } from './selection.js';
+// Terminal abstraction: provides stdout/stderr handles, sync output support,
+// extended key protocol detection, and the diff-based terminal writer
 import { SYNC_OUTPUT_SUPPORTED, supportsExtendedKeys, type Terminal, writeDiffToTerminal } from './terminal.js';
+// Terminal escape sequences: cursor movement, screen erase, keyboard protocol control
 import { CURSOR_HOME, cursorMove, cursorPosition, DISABLE_KITTY_KEYBOARD, DISABLE_MODIFY_OTHER_KEYS, ENABLE_KITTY_KEYBOARD, ENABLE_MODIFY_OTHER_KEYS, ERASE_SCREEN } from './termio/csi.js';
+// DEC private mode sequences: alternate screen, mouse tracking, cursor visibility
 import { DBP, DFE, DISABLE_MOUSE_TRACKING, ENABLE_MOUSE_TRACKING, ENTER_ALT_SCREEN, EXIT_ALT_SCREEN, SHOW_CURSOR } from './termio/dec.js';
+// OSC (Operating System Command) sequences: clipboard, iTerm2 progress, tab status
 import { CLEAR_ITERM2_PROGRESS, CLEAR_TAB_STATUS, setClipboard, supportsTabStatus, wrapForMultiplexer } from './termio/osc.js';
+// Provider for terminal write access (used by useTerminalNotification hook)
 import { TerminalWriteProvider } from './useTerminalNotification.js';
 
 // Alt-screen: renderer.ts sets cursor.visible = !isTTY || screen.height===0,
@@ -64,6 +129,12 @@ function makeAltScreenParkPatch(terminalRows: number) {
     content: cursorPosition(terminalRows, 1)
   });
 }
+// ─── Ink Class Configuration ─────────────────────────────────────────────────
+// Configuration for rendering to a specific terminal (stdout/stdin/stderr).
+// exitOnCtrlC: whether to exit the process on Ctrl+C
+// patchConsole: whether to intercept console.log/error during rendering
+// waitUntilExit: optional promise that resolves when the process should exit
+// onFrame: optional callback fired after each frame render with timing metrics
 export type Options = {
   stdout: NodeJS.WriteStream;
   stdin: NodeJS.ReadStream;
@@ -73,33 +144,67 @@ export type Options = {
   waitUntilExit?: () => Promise<void>;
   onFrame?: (event: FrameEvent) => void;
 };
+// =============================================================================
+// Ink Class — The Core Terminal Rendering Engine
+// =============================================================================
+// Each Ink instance manages one React tree rendered to one terminal.
+// It owns the reconciler container, the double-buffered screen frames,
+// the Yoga layout engine integration, text selection, search highlights,
+// and the terminal I/O pipeline.
 export default class Ink {
+  // LogUpdate manages incremental writes to the terminal (non-alt-screen mode)
   private readonly log: LogUpdate;
+  // Terminal handles: stdout + stderr for writing escape sequences
   private readonly terminal: Terminal;
+  // Throttled render scheduler — called by the reconciler after each React commit.
+  // Throttled to FRAME_INTERVAL_MS to cap rendering to ~60fps.
   private scheduleRender: (() => void) & {
     cancel?: () => void;
   };
   // Ignore last render after unmounting a tree to prevent empty output before exit
   private isUnmounted = false;
+  // When true, rendering is paused (e.g., during shell job control SIGTSTP)
   private isPaused = false;
+  // The React reconciler's internal fiber root container
   private readonly container: FiberRoot;
+  // The root virtual DOM node — all other nodes are children of this
   private rootNode: dom.DOMElement;
+  // Focus manager: tracks which component has keyboard focus for tab navigation
   readonly focusManager: FocusManager;
+  // The renderer converts the DOM tree into a Frame (screen buffer + cursor)
   private renderer: Renderer;
+  // ─── Memory Pools ────────────────────────────────────────────────────────
+  // Pools deduplicate strings across cells to reduce memory pressure.
+  // StylePool: deduplicates ANSI style strings
+  // CharPool: deduplicates character content strings
+  // HyperlinkPool: deduplicates OSC 8 hyperlink escape sequences
   private readonly stylePool: StylePool;
   private charPool: CharPool;
   private hyperlinkPool: HyperlinkPool;
+  // Promise that resolves when the Ink instance is fully unmounted
   private exitPromise?: Promise<void>;
+  // Cleanup functions for console patching (restored on unmount)
   private restoreConsole?: () => void;
   private restoreStderr?: () => void;
+  // Cleanup function for TTY event handlers (resize, SIGCONT)
   private readonly unsubscribeTTYHandlers?: () => void;
+  // Current terminal dimensions — updated on resize events
   private terminalColumns: number;
   private terminalRows: number;
+  // The current React element tree being rendered
   private currentNode: ReactNode = null;
+  // ─── Double-Buffered Frames ──────────────────────────────────────────────
+  // frontFrame: the frame currently displayed on the terminal
+  // backFrame: the frame being rendered (will become frontFrame after paint)
+  // Double-buffering enables efficient diff-based rendering — only changed
+  // cells are written to the terminal, minimizing flicker.
   private frontFrame: Frame;
   private backFrame: Frame;
+  // Timestamp of last pool reset (pools are periodically flushed to reclaim memory)
   private lastPoolResetTime = performance.now();
+  // Timer for draining pending writes
   private drainTimer: ReturnType<typeof setTimeout> | null = null;
+  // Tracks Yoga layout performance counters between frames
   private lastYogaCounters: {
     ms: number;
     visited: number;
@@ -177,24 +282,40 @@ export default class Ink {
     x: number;
     y: number;
   } | null = null;
+  // ─── Constructor ────────────────────────────────────────────────────────
+  // Initializes the Ink rendering engine:
+  //   1. Patches console if requested (redirects console.log during rendering)
+  //   2. Sets up terminal dimensions and memory pools
+  //   3. Creates empty front/back frame buffers
+  //   4. Sets up throttled render scheduling with microtask deferral
+  //   5. Registers process exit and TTY resize handlers
+  //   6. Creates the root DOM node with Yoga layout
+  //   7. Creates the React reconciler container
   constructor(private readonly options: Options) {
+    // autoBind ensures all methods keep their `this` context when passed as callbacks
     autoBind(this);
     if (this.options.patchConsole) {
       this.restoreConsole = this.patchConsole();
       this.restoreStderr = this.patchStderr();
     }
+    // Set up terminal I/O handles
     this.terminal = {
       stdout: options.stdout,
       stderr: options.stderr
     };
+    // Initialize terminal dimensions (fallback to 80x24 if not a TTY)
     this.terminalColumns = options.stdout.columns || 80;
     this.terminalRows = options.stdout.rows || 24;
+    // Pre-compute the alt-screen cursor park position (bottom of screen)
     this.altScreenParkPatch = makeAltScreenParkPatch(this.terminalRows);
+    // Initialize memory pools for string deduplication across cells
     this.stylePool = new StylePool();
     this.charPool = new CharPool();
     this.hyperlinkPool = new HyperlinkPool();
+    // Create empty frame buffers sized to the terminal dimensions
     this.frontFrame = emptyFrame(this.terminalRows, this.terminalColumns, this.stylePool, this.charPool, this.hyperlinkPool);
     this.backFrame = emptyFrame(this.terminalRows, this.terminalColumns, this.stylePool, this.charPool, this.hyperlinkPool);
+    // Initialize the log-update writer for non-alt-screen rendering
     this.log = new LogUpdate({
       isTTY: options.stdout.isTTY as boolean | undefined || false,
       stylePool: this.stylePool
@@ -222,6 +343,7 @@ export default class Ink {
     this.unsubscribeExit = onExit(this.unmount, {
       alwaysLast: false
     });
+    // Register TTY-specific event handlers for resize and SIGCONT (resume from bg)
     if (options.stdout.isTTY) {
       options.stdout.on('resize', this.handleResize);
       process.on('SIGCONT', this.handleResume);
@@ -230,12 +352,19 @@ export default class Ink {
         process.off('SIGCONT', this.handleResume);
       };
     }
+    // Create the root virtual DOM node — all Ink components will be children of this
     this.rootNode = dom.createNode('ink-root');
+    // Set up focus management with the reconciler's event dispatcher
     this.focusManager = new FocusManager((target, event) => dispatcher.dispatchDiscrete(target, event));
     this.rootNode.focusManager = this.focusManager;
+    // Create the renderer that converts DOM tree → Frame
     this.renderer = createRenderer(this.rootNode, this.stylePool);
+    // Wire up render scheduling: called by the reconciler after React commits
     this.rootNode.onRender = this.scheduleRender;
+    // Direct render path for tests (bypasses throttling)
     this.rootNode.onImmediateRender = this.onRender;
+    // Compute Yoga layout during React's commit phase so useLayoutEffect hooks
+    // have access to fresh layout data
     this.rootNode.onComputeLayout = () => {
       // Calculate layout during React's commit phase so useLayoutEffect hooks
       // have access to fresh layout data

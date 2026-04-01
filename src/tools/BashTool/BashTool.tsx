@@ -1,3 +1,27 @@
+// =============================================================================
+// BashTool — Shell command execution tool
+// =============================================================================
+//
+// Architecture overview:
+// This tool provides sandboxed shell command execution with a sophisticated
+// permission model, background task management, and progress streaming.
+//
+// Key design decisions:
+// 1. SECURITY: Commands are parsed via AST (parseForSecurity) for permission
+//    matching. Compound commands (e.g., "ls && git push") are split so each
+//    subcommand is individually checked against permission rules.
+// 2. SANDBOXING: Commands can be sandboxed via SandboxManager to restrict
+//    filesystem access. The sandbox can be disabled per-command via
+//    dangerouslyDisableSandbox (requires explicit user approval).
+// 3. BACKGROUND TASKS: Long-running commands can be explicitly backgrounded
+//    (run_in_background=true), auto-backgrounded on timeout, or manually
+//    backgrounded by the user (Ctrl+B). Background tasks are tracked in
+//    AppState and produce <task_notification> on completion.
+// 4. PROGRESS STREAMING: Uses an async generator pattern to yield progress
+//    updates while the command runs, enabling real-time output display.
+// 5. SED EDIT SIMULATION: sed in-place edits are intercepted and simulated
+//    to ensure the user-previewed content is exactly what gets written.
+// =============================================================================
 import { feature } from 'bun:bundle';
 import type { ToolResultBlockParam } from '@anthropic-ai/sdk/resources/index.mjs';
 import { copyFile, stat as fsStat, truncate as fsTruncate, link } from 'fs/promises';
@@ -14,7 +38,12 @@ import { buildTool, type ToolDef } from '../../Tool.js';
 import { backgroundExistingForegroundTask, markTaskNotified, registerForeground, spawnShellTask, unregisterForeground } from '../../tasks/LocalShellTask/LocalShellTask.js';
 import type { AgentId } from '../../types/ids.js';
 import type { AssistantMessage } from '../../types/message.js';
+// SECURITY: parseForSecurity produces an AST-level breakdown of compound
+// commands, used by preparePermissionMatcher to check each subcommand
+// individually against permission rules (e.g., "Bash(git *)").
 import { parseForSecurity } from '../../utils/bash/ast.js';
+// splitCommandWithOperators: splits on shell operators (&&, ||, |, ;) for
+// command classification. splitCommand_DEPRECATED: older splitting for analytics.
 import { splitCommand_DEPRECATED, splitCommandWithOperators } from '../../utils/bash/commands.js';
 import { extractClaudeCodeHints } from '../../utils/claudeCodeHints.js';
 import { detectCodeIndexingFromCommand } from '../../utils/codeIndexing.js';
@@ -30,6 +59,9 @@ import type { PermissionResult } from '../../utils/permissions/PermissionResult.
 import { maybeRecordPluginHint } from '../../utils/plugins/hintRecommendation.js';
 import { exec } from '../../utils/Shell.js';
 import type { ExecResult } from '../../utils/ShellCommand.js';
+// SandboxManager enforces filesystem access restrictions on shell commands.
+// When shouldUseSandbox returns true, the command runs inside a restricted
+// environment that blocks writes outside allowed directories.
 import { SandboxManager } from '../../utils/sandbox/sandbox-adapter.js';
 import { semanticBoolean } from '../../utils/semanticBoolean.js';
 import { semanticNumber } from '../../utils/semanticNumber.js';
@@ -40,6 +72,11 @@ import { isOutputLineTruncated } from '../../utils/terminal.js';
 import { buildLargeToolResultMessage, ensureToolResultsDir, generatePreview, getToolResultPath, PREVIEW_SIZE_BYTES } from '../../utils/toolResultStorage.js';
 import { userFacingName as fileEditUserFacingName } from '../FileEditTool/UI.js';
 import { trackGitOperations } from '../shared/gitOperationTracking.js';
+// bashToolHasPermission: main permission gate — checks the command against
+// user-configured permission rules (allow/deny patterns).
+// commandHasAnyCd: detects cd subcommands for read-only classification.
+// matchWildcardPattern / permissionRuleExtractPrefix: pattern matching for
+// permission rules like "Bash(git *)" or "Bash(npm run test:*)".
 import { bashToolHasPermission, commandHasAnyCd, matchWildcardPattern, permissionRuleExtractPrefix } from './bashPermissions.js';
 import { interpretCommandResult } from './commandSemantics.js';
 import { getDefaultTimeoutMs, getMaxTimeoutMs, getSimplePrompt } from './prompt.js';
@@ -224,6 +261,11 @@ const DISALLOWED_AUTO_BACKGROUND_COMMANDS = ['sleep' // Sleep should run in fore
 const isBackgroundTasksDisabled =
 // eslint-disable-next-line custom-rules/no-process-env-top-level -- Intentional: schema must be defined at module load
 isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS);
+// ---- Input Schema Definition ----
+// Uses lazySchema to defer Zod schema construction until first access,
+// enabling feature-gated schema variants without top-level side effects.
+// The full schema includes _simulatedSedEdit (internal-only) and all
+// optional fields; the model-facing schema omits sensitive fields.
 const fullInputSchema = lazySchema(() => z.strictObject({
   command: z.string().describe('The command to execute'),
   timeout: semanticNumber(z.number().optional()).describe(`Optional timeout in milliseconds (max ${getMaxTimeoutMs()})`),
@@ -417,11 +459,17 @@ async function applySedEdit(simulatedEdit: {
     }
   };
 }
+// ---- BashTool Definition ----
+// Built via the buildTool() factory which provides the standard tool lifecycle:
+// validateInput → checkPermissions → call → mapToolResultToToolResultBlockParam.
+// The tool satisfies ToolDef<InputSchema, Out, BashProgress> meaning it supports
+// typed input parsing, typed output, and progress streaming via BashProgress events.
 export const BashTool = buildTool({
   name: BASH_TOOL_NAME,
   searchHint: 'execute shell commands',
   // 30K chars - tool result persistence threshold
   maxResultSizeChars: 30_000,
+  // strict: true means Zod schema validation rejects unknown properties
   strict: true,
   async description({
     description
@@ -431,6 +479,8 @@ export const BashTool = buildTool({
   async prompt() {
     return getSimplePrompt();
   },
+  // isConcurrencySafe: returns true when the command is read-only, allowing
+  // the tool orchestrator to run multiple read-only bash commands in parallel.
   isConcurrencySafe(input) {
     return this.isReadOnly?.(input) ?? false;
   },
@@ -442,6 +492,21 @@ export const BashTool = buildTool({
   toAutoClassifierInput(input) {
     return input.command;
   },
+  // ---- Permission Matching (SECURITY-CRITICAL) ----
+  // preparePermissionMatcher builds a function that checks if a permission
+  // rule pattern matches any subcommand in a compound command. This is used
+  // by the hook system (hooks.mdx) to decide whether a security hook should
+  // fire for a given command.
+  //
+  // Security invariant: compound commands like "ls && git push" must fire
+  // a hook if ANY subcommand matches the pattern, preventing bypass of
+  // security hooks by prepending innocuous commands.
+  //
+  // The implementation:
+  // 1. Parses the command into an AST via parseForSecurity
+  // 2. Extracts argv arrays (stripping leading VAR=val assignments)
+  // 3. Tests each subcommand against the pattern with prefix or wildcard matching
+  // 4. Falls back to always-match for unparseable commands (fail safe)
   async preparePermissionMatcher({
     command
   }) {
@@ -521,6 +586,10 @@ export const BashTool = buildTool({
     const desc = input.description ?? truncate(input.command, TOOL_SUMMARY_MAX_LENGTH);
     return `Running ${desc}`;
   },
+  // ---- Input Validation ----
+  // Runs before permission checks. Catches problematic patterns early:
+  // - Blocks standalone "sleep N" (N >= 2s) to prevent polling patterns;
+  //   suggests run_in_background or the Monitor tool instead.
   async validateInput(input: BashToolInput): Promise<ValidationResult> {
     if (feature('MONITOR_TOOL') && !isBackgroundTasksDisabled && !input.run_in_background) {
       const sleepPattern = detectBlockedSleepPattern(input.command);
@@ -536,6 +605,10 @@ export const BashTool = buildTool({
       result: true
     };
   },
+  // ---- Permission Check ----
+  // Delegates to bashToolHasPermission which evaluates the command against
+  // the user's configured permission rules (allow/deny lists in settings.json
+  // and CLAUDE.md). Returns 'allow', 'deny', or 'ask' (prompts the user).
   async checkPermissions(input, context): Promise<PermissionResult> {
     return bashToolHasPermission(input, context);
   },
@@ -621,6 +694,16 @@ export const BashTool = buildTool({
       is_error: interrupted
     };
   },
+  // ---- Main Execution Entry Point ----
+  // The call method is the core execution path after validation + permissions pass.
+  // Flow:
+  // 1. Check for simulated sed edit (pre-approved file write from permission dialog)
+  // 2. Create an async generator via runShellCommand that yields progress events
+  // 3. Consume generator, forwarding progress to the SDK via onProgress callback
+  // 4. Process the final ExecResult: track git ops, handle errors, manage images
+  // 5. Handle large output persistence (copy to tool-results dir for model access)
+  // 6. Strip Claude Code hint tags and extract plugin recommendations
+  // 7. Return the typed Out object with stdout, stderr, exit status, and metadata
   async call(input: BashToolInput, toolUseContext, _canUseTool?: CanUseToolFn, parentMessage?: AssistantMessage, onProgress?: ToolCallProgress<BashProgress>) {
     // Handle simulated sed edit - apply directly instead of running sed
     // This ensures what the user previewed is exactly what gets written
@@ -823,6 +906,30 @@ export const BashTool = buildTool({
     return isOutputLineTruncated(output.stdout) || isOutputLineTruncated(output.stderr);
   }
 } satisfies ToolDef<InputSchema, Out, BashProgress>);
+// ---- Shell Command Execution Engine (Async Generator) ----
+// runShellCommand is the core execution engine that wraps the low-level exec()
+// call with progress reporting, timeout handling, and background task management.
+//
+// Design: Uses an async generator pattern where:
+// - yield: emits progress updates (output snapshots + timing) to the caller
+// - return: produces the final ExecResult when the command completes
+//
+// Background task lifecycle:
+// 1. EXPLICIT: run_in_background=true → immediately spawns a background task
+//    and returns. The command runs independently of the current conversation.
+// 2. TIMEOUT: if the command exceeds its timeout AND auto-backgrounding is
+//    allowed (shouldAutoBackground), it's moved to a background task via
+//    shellCommand.onTimeout.
+// 3. ASSISTANT MODE: for the main thread in Kairos/assistant mode, a 15s timer
+//    (ASSISTANT_BLOCKING_BUDGET_MS) auto-backgrounds long commands to keep the
+//    agent responsive.
+// 4. USER CTRL+B: the user can manually background via the BackgroundHint UI,
+//    which transitions the foreground task to a background task.
+//
+// Progress signaling:
+// The onProgress callback from exec()'s shared poller resolves a Promise
+// (progressSignal), waking the generator from its Promise.race loop to yield
+// the latest output snapshot. This ensures the UI updates in real-time.
 async function* runShellCommand({
   input,
   abortController,
@@ -878,6 +985,19 @@ async function* runShellCommand({
   // Only enable for commands that are allowed to be auto-backgrounded
   // and when background tasks are not disabled
   const shouldAutoBackground = !isBackgroundTasksDisabled && isAutobackgroundingAllowed(command);
+  // Execute the command via the low-level exec() function which spawns a
+  // child process. The exec() call returns a ShellCommand handle with:
+  // - .result: Promise<ExecResult> that resolves when the command completes
+  // - .onTimeout: callback hook for auto-backgrounding on timeout
+  // - .taskOutput: TaskOutput for progress polling and output persistence
+  // - .cleanup: releases stream resources after consumption
+  //
+  // Options:
+  // - timeout: max wall-clock time before the command is interrupted/backgrounded
+  // - onProgress: called by the shared poller with latest output snapshots
+  // - preventCwdChanges: blocks cd in subagents to keep their cwd stable
+  // - shouldUseSandbox: enables filesystem sandboxing for this command
+  // - shouldAutoBackground: allows timeout-triggered auto-backgrounding
   const shellCommand = await exec(command, abortController.signal, 'bash', {
     timeout: timeoutMs,
     onProgress(lastLines, allLines, totalLines, totalBytes, isIncomplete) {
@@ -1000,6 +1120,11 @@ async function* runShellCommand({
     };
   }
 
+  // ---- Initial Wait Phase ----
+  // Wait for PROGRESS_THRESHOLD_MS (2s) before showing progress UI.
+  // If the command completes within this window, return immediately
+  // without ever showing progress indicators (keeps fast commands clean).
+  // If auto-backgrounding fired during this window, return the background ID.
   // Wait for the initial threshold before showing progress
   const startTime = Date.now();
   let foregroundTaskId: string | undefined = undefined;
@@ -1024,12 +1149,17 @@ async function* runShellCommand({
     }
   }
 
+  // ---- Progress Polling Loop ----
   // Start polling the output file for progress. The poller's #tick calls
   // onProgress every second, which resolves progressSignal below.
   TaskOutput.startPolling(shellCommand.taskOutput.taskId);
 
   // Progress loop: wake is driven by the shared poller calling onProgress,
   // which resolves the progressSignal.
+  // Each iteration races the command result against the next progress signal.
+  // When a progress signal fires: yield the latest output snapshot and loop.
+  // When the result resolves: handle completion/backgrounding and return.
+  // The finally block ensures polling is stopped even on abort/error.
   try {
     while (true) {
       const progressSignal = createProgressSignal();

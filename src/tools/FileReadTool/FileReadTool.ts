@@ -1,3 +1,34 @@
+// =============================================================================
+// FileReadTool — Multi-format file reading tool
+// =============================================================================
+//
+// Architecture overview:
+// This tool reads files and returns their content in a format appropriate for
+// the model to consume. It handles multiple file types with specialized paths:
+//
+// Content routing (in callInner):
+// 1. NOTEBOOKS (.ipynb): Parsed via readNotebook(), cells returned as structured
+//    JSON. Token-validated to prevent oversized context injection.
+// 2. IMAGES (.png/.jpg/.gif/.webp): Read as binary, resized to fit token budget
+//    via maybeResizeAndDownsampleImageBuffer. Aggressive compression fallback
+//    if standard resize exceeds token limit.
+// 3. PDFs: Two modes — full document (sent as DocumentBlockParam for models
+//    that support it) or page extraction (poppler-based, returned as images).
+//    Page count limits prevent reading 100+ page PDFs at once.
+// 4. TEXT: Line-based reading with offset/limit support. Content is prefixed
+//    with line numbers for precise editing references.
+//
+// Key design decisions:
+// - DEDUPLICATION: If the same file+range was already read and hasn't changed
+//   on disk (mtime check), returns a FILE_UNCHANGED_STUB instead of re-sending
+//   the full content, saving ~18% of cache_creation tokens.
+// - TOKEN VALIDATION: Two-pass approach — rough estimate first (fast, byte-based),
+//   then API-based count only if the estimate exceeds 25% of the limit.
+// - PERMISSION MODEL: Read permissions checked via checkReadPermissionForTool,
+//   with deny rules from settings.json. UNC path check blocks NTLM credential leaks.
+// - SECURITY: Blocked device paths (/dev/zero, /dev/random, etc.) prevent hangs.
+//   CYBER_RISK_MITIGATION_REMINDER appended to text reads warns about malware analysis.
+// =============================================================================
 import type { Base64ImageSource } from '@anthropic-ai/sdk/resources/index.mjs'
 import { readdir, readFile as readFileAsync } from 'fs/promises'
 import * as path from 'path'
@@ -245,6 +276,15 @@ type InputSchema = ReturnType<typeof inputSchema>
 
 export type Input = z.infer<InputSchema>
 
+// ---- Output Schema (Discriminated Union) ----
+// The output uses a discriminated union on 'type' to handle the different
+// file format responses. Each variant carries format-specific data:
+// - 'text': line-numbered content with range metadata
+// - 'image': base64-encoded image with dimension info for coordinate mapping
+// - 'notebook': structured cell array from .ipynb
+// - 'pdf': base64-encoded PDF for inline document rendering
+// - 'parts': extracted page images from large PDFs (poppler-based)
+// - 'file_unchanged': dedup stub when file hasn't changed since last read
 const outputSchema = lazySchema(() => {
   // Define the media types supported for images
   const imageMediaTypes = z.enum([
@@ -334,6 +374,13 @@ type OutputSchema = ReturnType<typeof outputSchema>
 
 export type Output = z.infer<OutputSchema>
 
+// ---- FileReadTool Definition ----
+// Built via buildTool() factory. Key characteristics:
+// - maxResultSizeChars: Infinity because output is bounded by maxTokens
+//   validation. Persisting large reads to a file that the model reads back
+//   via Read would be circular, so we never persist.
+// - isConcurrencySafe/isReadOnly: always true — reads are side-effect-free
+//   and can safely run in parallel with other tools.
 export const FileReadTool = buildTool({
   name: FILE_READ_TOOL_NAME,
   searchHint: 'read files, images, PDFs, notebooks',
@@ -395,6 +442,10 @@ export const FileReadTool = buildTool({
   async preparePermissionMatcher({ file_path }) {
     return pattern => matchWildcardPattern(pattern, file_path)
   },
+  // ---- Permission Check ----
+  // Delegates to checkReadPermissionForTool which evaluates the file path
+  // against user-configured permission rules (allow/deny patterns).
+  // Read permissions are generally more permissive than write permissions.
   async checkPermissions(input, context): Promise<PermissionDecision> {
     const appState = context.getAppState()
     return checkReadPermissionForTool(
@@ -415,6 +466,14 @@ export const FileReadTool = buildTool({
     return ''
   },
   renderToolUseErrorMessage,
+  // ---- Input Validation (Multi-layer, No I/O until permission granted) ----
+  // Validation is ordered to perform all non-I/O checks first:
+  // 1. PDF page range parsing (pure string validation)
+  // 2. Deny rule check (permission settings)
+  // 3. SECURITY: UNC path check — defers filesystem operations to prevent
+  //    NTLM credential leaks on Windows (SMB auth triggered by fs.existsSync)
+  // 4. Binary extension check (known binary formats that can't be rendered)
+  // 5. Blocked device paths (prevents hangs from /dev/zero, /dev/random, etc.)
   async validateInput({ file_path, pages }, toolUseContext: ToolUseContext) {
     // Validate pages parameter (pure string parsing, no I/O)
     if (pages !== undefined) {
@@ -493,6 +552,16 @@ export const FileReadTool = buildTool({
 
     return { result: true }
   },
+  // ---- Main Execution Entry Point ----
+  // The call method orchestrates the entire read pipeline:
+  // 1. Resolve file limits (maxSizeBytes, maxTokens) with caller overrides
+  // 2. Expand and normalize the file path
+  // 3. DEDUP CHECK: if the same file+range was read before and mtime matches,
+  //    return 'file_unchanged' stub to save context tokens (~18% reduction)
+  // 4. Discover skills from the file path (background, non-blocking)
+  // 5. Delegate to callInner for content-type-specific reading
+  // 6. Handle ENOENT with macOS screenshot path fallback (thin space vs space)
+  //    and helpful "Did you mean X?" suggestions
   async call(
     { file_path, offset = 1, limit = undefined, pages },
     context,
@@ -649,6 +718,17 @@ export const FileReadTool = buildTool({
       throw error
     }
   },
+  // ---- Model-Facing Output Serialization ----
+  // mapToolResultToToolResultBlockParam converts the typed output data into
+  // the ToolResultBlockParam format that gets sent back to the Claude API.
+  // Different output types get different serialization:
+  // - image: sent as an image content block (base64) for vision processing
+  // - notebook: cell array mapped to structured tool result
+  // - pdf: metadata text only — actual PDF bytes are sent as supplemental
+  //   DocumentBlockParam via newMessages (separate from tool_result)
+  // - parts: page extraction summary — images sent via newMessages
+  // - file_unchanged: short stub pointing model to earlier read in context
+  // - text: line-numbered content with optional malware analysis reminder
   mapToolResultToToolResultBlockParam(data, toolUseID) {
     switch (data.type) {
       case 'image': {
@@ -752,6 +832,14 @@ function memoryFileFreshnessPrefix(data: object): string {
   return memoryFreshnessNote(mtimeMs)
 }
 
+// ---- Token Validation (Two-Pass Approach) ----
+// Validates that file content won't exceed the model's token limit.
+// Pass 1 (fast): roughTokenCountEstimationForFileType — byte-based heuristic
+//   that accounts for file type (code compresses ~4:1, prose ~3:1).
+//   If estimate <= 25% of limit, skip the expensive API call.
+// Pass 2 (accurate): countTokensWithAPI — actual tokenizer count via API.
+//   Only called when the rough estimate suggests the file might be too large.
+// Throws MaxFileReadTokenExceededError with token count details on failure.
 async function validateContentTokens(
   content: string,
   ext: string,
@@ -798,6 +886,20 @@ function createImageResponse(
   }
 }
 
+// ---- Content-Type Router (callInner) ----
+// Inner implementation of call(), separated to allow ENOENT handling in the outer call.
+// Routes to specialized handlers based on file extension:
+// - .ipynb → Notebook handler (JSON cell parsing + token validation)
+// - .png/.jpg/.gif/.webp → Image handler (resize + token budget compression)
+// - .pdf → PDF handler (inline document or page extraction)
+// - everything else → Text handler (line-based reading with offset/limit)
+//
+// Each handler:
+// 1. Reads the file content in the appropriate format
+// 2. Validates size/token constraints
+// 3. Updates readFileState for dedup tracking
+// 4. Triggers skill discovery for the file path
+// 5. Returns typed output data + optional newMessages for supplemental content
 /**
  * Inner implementation of call, separated to allow ENOENT handling in the outer call.
  */

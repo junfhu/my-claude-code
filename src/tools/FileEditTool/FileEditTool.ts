@@ -1,3 +1,34 @@
+// =============================================================================
+// FileEditTool — String-replacement-based file editing tool
+// =============================================================================
+//
+// Architecture overview:
+// This tool performs precise file edits using a string replacement mechanism:
+// the model provides old_string (text to find) and new_string (replacement).
+// This approach is preferred over full-file rewrites because:
+// 1. It's surgical — only the targeted text changes, reducing error surface
+// 2. It enables meaningful diffs and undo tracking
+// 3. It's token-efficient — the model only sends the changed portion
+//
+// Key design decisions:
+// 1. STRING REPLACEMENT: old_string must be found exactly once in the file
+//    (unless replace_all=true). This prevents ambiguous edits. Quote
+//    normalization (findActualString) handles curly↔straight quote mismatches.
+// 2. STALENESS DETECTION: Before writing, the tool checks if the file was
+//    modified since the last Read (via mtime comparison). This prevents
+//    overwrites of concurrent changes from linters, formatters, or the user.
+//    On Windows, mtime changes from cloud sync/antivirus are handled by
+//    content comparison fallback.
+// 3. LSP INTEGRATION: After writing, notifies LSP servers via didChange +
+//    didSave to trigger diagnostics (TypeScript errors, lint warnings, etc.)
+// 4. FILE HISTORY: Pre-edit content is backed up for undo support (idempotent
+//    v1 backup keyed on content hash).
+// 5. DIFF TRACKING: Structured patches are generated via getPatchForEdit for
+//    display in the UI and analytics.
+// 6. PERMISSION MODEL: Write permissions checked via checkWritePermissionForTool.
+//    Deny rules block edits to protected directories. Settings file edits
+//    undergo additional JSON schema validation.
+// =============================================================================
 import { dirname, isAbsolute, sep } from 'path'
 import { logEvent } from 'src/services/analytics/index.js'
 import { getFeatureValue_CACHED_MAY_BE_STALE } from '../../services/analytics/growthbook.js'
@@ -83,6 +114,9 @@ import {
 // that prevents OOM without being unnecessarily restrictive.
 const MAX_EDIT_FILE_SIZE = 1024 * 1024 * 1024 // 1 GiB (stat bytes)
 
+// ---- FileEditTool Definition ----
+// Built via buildTool() factory. Satisfies ToolDef<InputSchema, FileEditOutput>.
+// The lifecycle: validateInput → checkPermissions → call → mapToolResultToToolResultBlockParam.
 export const FileEditTool = buildTool({
   name: FILE_EDIT_TOOL_NAME,
   searchHint: 'modify file contents in place',
@@ -112,6 +146,9 @@ export const FileEditTool = buildTool({
   getPath(input): string {
     return input.file_path
   },
+  // backfillObservableInput: normalizes the file_path before hook evaluation.
+  // Expanding ~ and relative paths ensures permission allowlists can't be
+  // bypassed by using path aliases (e.g., "~/foo" vs "/home/user/foo").
   backfillObservableInput(input) {
     // hooks.mdx documents file_path as absolute; expand so hook allowlists
     // can't be bypassed via ~ or relative paths.
@@ -122,6 +159,11 @@ export const FileEditTool = buildTool({
   async preparePermissionMatcher({ file_path }) {
     return pattern => matchWildcardPattern(pattern, file_path)
   },
+  // ---- Permission Check ----
+  // Delegates to checkWritePermissionForTool which evaluates the file path
+  // against user-configured permission rules (allow/deny lists).
+  // In acceptEdits mode, file edits are auto-approved.
+  // In plan mode, the user is prompted to approve each edit.
   async checkPermissions(input, context): Promise<PermissionDecision> {
     const appState = context.getAppState()
     return checkWritePermissionForTool(
@@ -134,6 +176,27 @@ export const FileEditTool = buildTool({
   renderToolResultMessage,
   renderToolUseRejectedMessage,
   renderToolUseErrorMessage,
+  // ---- Input Validation (Comprehensive, Multi-Stage) ----
+  // validateInput performs extensive checks BEFORE the edit is applied:
+  //
+  // Stage 1 — Quick rejections (no I/O):
+  //   - Team memory secret check (prevents secrets in shared memory files)
+  //   - No-op detection (old_string === new_string)
+  //   - Deny rule check (blocked directories)
+  //   - SECURITY: UNC path check (prevents NTLM credential leaks on Windows)
+  //
+  // Stage 2 — File system checks:
+  //   - File size limit (1 GiB max to prevent OOM)
+  //   - File existence check with helpful suggestions on ENOENT
+  //   - Empty old_string logic: creates new file OR replaces empty file content
+  //   - Notebook redirect (.ipynb → NotebookEditTool)
+  //
+  // Stage 3 — Staleness + string matching:
+  //   - Read-before-write enforcement (file must be Read first)
+  //   - Staleness detection via mtime comparison (with Windows content fallback)
+  //   - String matching via findActualString (handles quote normalization)
+  //   - Uniqueness check: old_string must match exactly once (unless replace_all)
+  //   - Settings file schema validation (JSON structure integrity)
   async validateInput(input: FileEditInput, toolUseContext: ToolUseContext) {
     const { file_path, old_string, new_string, replace_all = false } = input
     // Use expandPath for consistent path normalization (especially on Windows
@@ -384,6 +447,28 @@ export const FileEditTool = buildTool({
       },
     )
   },
+  // ---- Main Execution Entry Point (Read-Modify-Write) ----
+  // The call method performs the actual file edit as an atomic-ish operation.
+  //
+  // Critical section design:
+  // - Async operations (mkdir, fileHistory backup) happen BEFORE the critical section
+  // - The read-modify-write (readFileForEdit → getPatchForEdit → writeTextContent)
+  //   is synchronous to minimize the window for concurrent modification
+  // - Staleness is re-checked in the critical section (double-check pattern)
+  //
+  // Step-by-step flow:
+  // 1. Normalize path, discover skills (background)
+  // 2. Notify diagnosticTracker that edit is about to happen
+  // 3. Create parent directory + backup file history (pre-critical)
+  // 4. CRITICAL: Read file content synchronously (readFileForEdit)
+  // 5. CRITICAL: Re-verify staleness (mtime since last Read)
+  // 6. CRITICAL: Find actual string (handles quote normalization)
+  // 7. CRITICAL: Generate patch + apply replacement
+  // 8. CRITICAL: Write to disk (writeTextContent preserves encoding + line endings)
+  // 9. Post-write: Notify LSP (didChange + didSave for diagnostics)
+  // 10. Post-write: Notify VS Code for diff view
+  // 11. Post-write: Update readFileState (new mtime for staleness tracking)
+  // 12. Post-write: Log analytics + compute git diff (if enabled)
   async call(
     input: FileEditInput,
     {
@@ -468,6 +553,10 @@ export const FileEditTool = buildTool({
     }
 
     // 3. Use findActualString to handle quote normalization
+    // findActualString tries the exact string first, then falls back to
+    // a version with curly quotes mapped to straight quotes (and vice versa).
+    // This handles cases where the model sends straight quotes but the file
+    // uses curly quotes (common in documentation and copy-pasted content).
     const actualOldString =
       findActualString(originalFileContents, old_string) || old_string
 
@@ -490,7 +579,11 @@ export const FileEditTool = buildTool({
     // 5. Write to disk
     writeTextContent(absoluteFilePath, updatedFile, encoding, endings)
 
+    // ---- LSP Integration ----
     // Notify LSP servers about file modification (didChange) and save (didSave)
+    // This triggers real-time diagnostics (TypeScript type errors, ESLint warnings,
+    // etc.) that appear in the diagnostic tracker for the model to observe.
+    // Both notifications are fire-and-forget (.catch) to avoid blocking the edit.
     const lspManager = getLspServerManager()
     if (lspManager) {
       // Clear previously delivered diagnostics so new ones will be shown
@@ -517,6 +610,11 @@ export const FileEditTool = buildTool({
     notifyVscodeFileUpdated(absoluteFilePath, originalFileContents, updatedFile)
 
     // 6. Update read timestamp, to invalidate stale writes
+    // This ensures that a subsequent Edit against the same file will see
+    // the new mtime and won't falsely detect a concurrent modification.
+    // Setting offset/limit to undefined marks this as a full-file state
+    // (as opposed to a partial Read), so dedup won't incorrectly match
+    // against a prior Read's content.
     readFileState.set(absoluteFilePath, {
       content: updatedFile,
       timestamp: getFileModificationTime(absoluteFilePath),
@@ -596,6 +694,13 @@ export const FileEditTool = buildTool({
 
 // --
 
+// ---- Synchronous File Read for Edit (Critical Section Helper) ----
+// Reads a file synchronously using readFileSyncWithMetadata to minimize the
+// window between read and write (preventing concurrent modification races).
+// Returns file content, encoding (utf8 or utf16le), and line ending type (LF/CRLF)
+// so the write preserves the file's original format. If the file doesn't exist,
+// returns empty content with default encoding — this allows new file creation
+// via the empty old_string path.
 function readFileForEdit(absoluteFilePath: string): {
   content: string
   fileExists: boolean

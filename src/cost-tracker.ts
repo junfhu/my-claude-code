@@ -1,3 +1,26 @@
+// =============================================================================
+// cost-tracker.ts — Token Cost Tracking and Reporting
+// =============================================================================
+// Tracks API usage costs across the entire session. Provides:
+//   - Per-model token usage tracking (input, output, cache read, cache write)
+//   - USD cost calculation using per-model pricing from modelCost.ts
+//   - Session cost persistence (save/restore via project config for /resume)
+//   - Formatted cost display for the /cost command
+//   - OpenTelemetry counter integration for cost/token metrics
+//   - Advisor (sub-model) usage tracking for advisor tool calls
+//
+// Cost flow:
+//   1. Each API response includes a `Usage` object with token counts
+//   2. `addToTotalSessionCost()` is called after each API response
+//   3. It calculates USD cost via `calculateUSDCost()` using model pricing
+//   4. Accumulates into global state (bootstrap/state.ts counters)
+//   5. Records metrics via OpenTelemetry counters (cost, tokens by type)
+//   6. `formatTotalCost()` renders the /cost command output
+//   7. `saveCurrentSessionCosts()` persists to project config for resume
+//
+// The module re-exports many state accessors for convenience — most actual
+// state lives in bootstrap/state.ts to be accessible before React mounts.
+// =============================================================================
 import type { BetaUsage as Usage } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
 import chalk from 'chalk'
 import {
@@ -32,20 +55,29 @@ import {
   type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
   logEvent,
 } from './services/analytics/index.js'
+// Extracts advisor (sub-model) usage from an API response for recursive cost tracking
 import { getAdvisorUsage } from './utils/advisor.js'
 import {
   getCurrentProjectConfig,
   saveCurrentProjectConfig,
 } from './utils/config.js'
+// Gets context window size and max output tokens for a model (used for ModelUsage metadata)
 import {
   getContextWindowForModel,
   getModelMaxOutputTokens,
 } from './utils/context.js'
+// Fast mode: when enabled, the API may use a faster but cheaper model variant
 import { isFastModeEnabled } from './utils/fastMode.js'
 import { formatDuration, formatNumber } from './utils/format.js'
 import type { FpsMetrics } from './utils/fpsTracker.js'
+// Maps model IDs to canonical short names for display (e.g., "claude-3-5-sonnet-20241022" → "Sonnet")
 import { getCanonicalName } from './utils/model/model.js'
+// Calculates the USD cost for a given model and usage using per-model pricing tables
 import { calculateUSDCost } from './utils/modelCost.js'
+
+// ─── Re-exports ──────────────────────────────────────────────────────────────
+// These are re-exported from bootstrap/state.ts for convenience so consumers
+// can import cost-related functions from a single module.
 export {
   getTotalCostUSD as getTotalCost,
   getTotalDuration,
@@ -68,14 +100,23 @@ export {
   getUsageForModel,
 }
 
+// Shape of cost state persisted to the project config file (.claude/project.json).
+// Saved when switching sessions or on exit, restored when resuming a session.
 type StoredCostState = {
+  // Accumulated USD cost for the session
   totalCostUSD: number
+  // Total time spent in API calls (including retries)
   totalAPIDuration: number
+  // Total time spent in API calls (excluding retry overhead)
   totalAPIDurationWithoutRetries: number
+  // Total time spent executing tools (bash, file operations, etc.)
   totalToolDuration: number
+  // Lines of code added/removed across all file edits
   totalLinesAdded: number
   totalLinesRemoved: number
+  // Wall-clock duration of the last completed turn
   lastDuration: number | undefined
+  // Per-model token usage breakdown (keyed by model name)
   modelUsage: { [modelName: string]: ModelUsage } | undefined
 }
 
@@ -90,11 +131,14 @@ export function getStoredSessionCosts(
   const projectConfig = getCurrentProjectConfig()
 
   // Only return costs if this is the same session that was last saved
+  // This prevents loading stale costs from a different session
   if (projectConfig.lastSessionId !== sessionId) {
     return undefined
   }
 
-  // Build model usage with context windows
+  // Build model usage with context windows — enriches stored usage data
+  // with current context window and max output token info (which may differ
+  // from when the session was saved if models have been updated)
   let modelUsage: { [modelName: string]: ModelUsage } | undefined
   if (projectConfig.lastModelUsage) {
     modelUsage = Object.fromEntries(
@@ -174,17 +218,24 @@ export function saveCurrentSessionCosts(fpsMetrics?: FpsMetrics): void {
   }))
 }
 
+// Formats a USD cost value for display. Costs above $0.50 are shown with
+// 2 decimal places; smaller costs use 4 decimal places for precision.
 function formatCost(cost: number, maxDecimalPlaces: number = 4): string {
   return `$${cost > 0.5 ? round(cost, 100).toFixed(2) : cost.toFixed(maxDecimalPlaces)}`
 }
 
+// Formats per-model token usage into a multi-line string for the /cost command.
+// Groups usage by canonical model name (e.g., multiple sonnet variants → "Sonnet")
+// and shows input/output/cache read/cache write token counts with cost per model.
 function formatModelUsage(): string {
   const modelUsageMap = getModelUsage()
   if (Object.keys(modelUsageMap).length === 0) {
     return 'Usage:                 0 input, 0 output, 0 cache read, 0 cache write'
   }
 
-  // Accumulate usage by short name
+  // Accumulate usage by short name so that multiple model variants
+  // (e.g., claude-3-5-sonnet-20241022, claude-3-5-sonnet-latest) are
+  // grouped under a single canonical display name
   const usageByShortName: { [shortName: string]: ModelUsage } = {}
   for (const [model, usage] of Object.entries(modelUsageMap)) {
     const shortName = getCanonicalName(model)
@@ -225,6 +276,9 @@ function formatModelUsage(): string {
   return result
 }
 
+// Formats the complete cost summary shown by the /cost command.
+// Includes: total cost, API duration, wall-clock duration, code changes,
+// per-model usage breakdown, and optional x402 payment summary.
 export function formatTotalCost(): string {
   const costDisplay =
     formatCost(getTotalCostUSD()) +
@@ -235,6 +289,7 @@ export function formatTotalCost(): string {
   const modelUsageDisplay = formatModelUsage()
 
   // Include x402 payment summary if any payments were made
+  // (x402 is a crypto payment protocol for tool access)
   let x402Display = ''
   try {
     const { formatX402Cost } = require('./services/x402/index.js') as typeof import('./services/x402/index.js')
@@ -255,15 +310,20 @@ ${modelUsageDisplay}${x402Display}`,
   )
 }
 
+// Rounds a number to the given precision (e.g., round(1.567, 100) → 1.57)
 function round(number: number, precision: number): number {
   return Math.round(number * precision) / precision
 }
 
+// Accumulates a single API response's usage into the running per-model totals.
+// Creates a new ModelUsage entry if this is the first response from this model.
+// Also enriches the ModelUsage with the model's context window and max output tokens.
 function addToTotalModelUsage(
   cost: number,
   usage: Usage,
   model: string,
 ): ModelUsage {
+  // Get existing usage for this model, or initialize with zeros
   const modelUsage = getUsageForModel(model) ?? {
     inputTokens: 0,
     outputTokens: 0,
@@ -275,31 +335,53 @@ function addToTotalModelUsage(
     maxOutputTokens: 0,
   }
 
+  // Accumulate token counts from this API response
   modelUsage.inputTokens += usage.input_tokens
   modelUsage.outputTokens += usage.output_tokens
   modelUsage.cacheReadInputTokens += usage.cache_read_input_tokens ?? 0
   modelUsage.cacheCreationInputTokens += usage.cache_creation_input_tokens ?? 0
+  // Web search requests are tracked under server_tool_use in the usage object
   modelUsage.webSearchRequests +=
     usage.server_tool_use?.web_search_requests ?? 0
   modelUsage.costUSD += cost
+  // Set context window and max output tokens (always use current values)
   modelUsage.contextWindow = getContextWindowForModel(model, getSdkBetas())
   modelUsage.maxOutputTokens = getModelMaxOutputTokens(model).default
   return modelUsage
 }
 
+// Main entry point for recording costs after each API response.
+// Called from the query pipeline after every successful API call.
+//
+// This function:
+//   1. Accumulates per-model usage totals
+//   2. Updates global cost state in bootstrap/state.ts
+//   3. Records OpenTelemetry metrics (cost counter, token counters by type)
+//   4. Recursively processes advisor usage (sub-model calls within the response)
+//   5. Returns the total cost including advisor costs
+//
+// @param cost - The USD cost of this API call (calculated by the caller)
+// @param usage - The token usage object from the API response
+// @param model - The model name used for this API call
+// @returns Total cost including any recursive advisor costs
 export function addToTotalSessionCost(
   cost: number,
   usage: Usage,
   model: string,
 ): number {
+  // Update per-model usage totals
   const modelUsage = addToTotalModelUsage(cost, usage, model)
+  // Update global cost state (used by getTotalCostUSD() and the /cost command)
   addToTotalCostState(cost, modelUsage, model)
 
+  // Build OpenTelemetry attributes — includes speed attribute in fast mode
   const attrs =
     isFastModeEnabled() && usage.speed === 'fast'
       ? { model, speed: 'fast' }
       : { model }
 
+  // Record cost and token metrics via OpenTelemetry counters
+  // These are exported to observability backends for monitoring
   getCostCounter()?.add(cost, attrs)
   getTokenCounter()?.add(usage.input_tokens, { ...attrs, type: 'input' })
   getTokenCounter()?.add(usage.output_tokens, { ...attrs, type: 'output' })
@@ -312,9 +394,15 @@ export function addToTotalSessionCost(
     type: 'cacheCreation',
   })
 
+  // Track total cost including advisor sub-model usage.
+  // Advisors are sub-models invoked within the main API call (e.g., for
+  // internal routing or classification). Their costs are tracked separately
+  // and logged as analytics events, then recursively accumulated.
   let totalCost = cost
   for (const advisorUsage of getAdvisorUsage(usage)) {
+    // Calculate cost for this advisor sub-model call
     const advisorCost = calculateUSDCost(advisorUsage.model, advisorUsage)
+    // Log advisor usage as a separate analytics event for monitoring
     logEvent('tengu_advisor_tool_token_usage', {
       advisor_model:
         advisorUsage.model as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
@@ -325,6 +413,7 @@ export function addToTotalSessionCost(
         advisorUsage.cache_creation_input_tokens ?? 0,
       cost_usd_micros: Math.round(advisorCost * 1_000_000),
     })
+    // Recursively add advisor cost to total (advisors may themselves have advisors)
     totalCost += addToTotalSessionCost(
       advisorCost,
       advisorUsage,

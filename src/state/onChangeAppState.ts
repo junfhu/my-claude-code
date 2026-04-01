@@ -1,3 +1,29 @@
+// =============================================================================
+// onChangeAppState.ts — Side-effect handlers triggered on every state change
+// =============================================================================
+//
+// This module implements the `onChange` callback wired into the store via
+// `createStore(initialState, onChangeAppState)` in AppStateProvider. It is
+// called synchronously by Store.setState *before* React subscriber
+// notifications, which means:
+//   1. External systems (CCR, disk config, SDK status) are updated before
+//      any React component re-renders.
+//   2. The function must be fast — it runs on every single setState call.
+//
+// The handler compares oldState vs newState for specific fields and
+// triggers side-effects only when those fields actually changed. This
+// is a centralized "diff & react" approach that replaces scattered
+// manual notification calls throughout the codebase.
+//
+// Side-effects handled here:
+//   • Permission mode → CCR external_metadata + SDK status stream
+//   • mainLoopModel → settings file + bootstrap override
+//   • expandedView → globalConfig persistence (showExpandedTodos / showSpinnerTree)
+//   • verbose → globalConfig persistence
+//   • tungstenPanelVisible → globalConfig persistence (ant-only)
+//   • settings → clear auth caches + re-apply environment variables
+// =============================================================================
+
 import { setMainLoopModelOverride } from '../bootstrap/state.js'
 import {
   clearApiKeyHelperCache,
@@ -20,6 +46,17 @@ import {
 import { updateSettingsForSource } from '../utils/settings/settings.js'
 import type { AppState } from './AppStateStore.js'
 
+// ---------------------------------------------------------------------------
+// externalMetadataToAppState — Converts CCR external metadata back into an
+// AppState updater function.
+//
+// This is the inverse of the metadata push in onChangeAppState: when a
+// worker process restarts, it reads the latest external_metadata from CCR
+// and uses this function to restore the AppState fields (permission_mode,
+// isUltraplanMode) that were previously pushed out.
+//
+// Returns a state updater function compatible with store.setState().
+// ---------------------------------------------------------------------------
 // Inverse of the push below — restore on worker restart.
 export function externalMetadataToAppState(
   metadata: SessionExternalMetadata,
@@ -40,6 +77,19 @@ export function externalMetadataToAppState(
   })
 }
 
+// ---------------------------------------------------------------------------
+// onChangeAppState — The main side-effect handler for state transitions.
+//
+// Wired as the `onChange` callback to createStore() in AppStateProvider.
+// Called synchronously on every setState that produces a new state reference
+// (i.e., Object.is(new, old) === false). Runs BEFORE React subscribers.
+//
+// Each block below handles one state field diff. The pattern is:
+//   if (newState.X !== oldState.X) { /* side-effect */ }
+//
+// This ensures side-effects only fire when the relevant field actually changed,
+// keeping the function efficient even though it runs on every state update.
+// ---------------------------------------------------------------------------
 export function onChangeAppState({
   newState,
   oldState,
@@ -47,6 +97,9 @@ export function onChangeAppState({
   newState: AppState
   oldState: AppState
 }) {
+  // =========================================================================
+  // 1. Permission mode sync → CCR + SDK
+  // =========================================================================
   // toolPermissionContext.mode — single choke point for CCR/SDK mode sync.
   //
   // Prior to this block, mode changes were relayed to CCR by only 2 of 8+
@@ -91,7 +144,14 @@ export function onChangeAppState({
     notifyPermissionModeChanged(newMode)
   }
 
+  // =========================================================================
+  // 2. Model override → settings file + bootstrap state
+  // =========================================================================
+
   // mainLoopModel: remove it from settings?
+  // When the user clears the model override (sets to null), remove it from
+  // the persisted user settings and clear the bootstrap override so the
+  // server-assigned default model is used for subsequent requests.
   if (
     newState.mainLoopModel !== oldState.mainLoopModel &&
     newState.mainLoopModel === null
@@ -102,6 +162,9 @@ export function onChangeAppState({
   }
 
   // mainLoopModel: add it to settings?
+  // When the user sets a model override (via /model command, --model flag, etc.),
+  // persist it to user settings and update the bootstrap override so the next
+  // API request uses this model.
   if (
     newState.mainLoopModel !== oldState.mainLoopModel &&
     newState.mainLoopModel !== null
@@ -111,7 +174,12 @@ export function onChangeAppState({
     setMainLoopModelOverride(newState.mainLoopModel)
   }
 
+  // =========================================================================
+  // 3. Expanded view → globalConfig persistence
+  // =========================================================================
   // expandedView → persist as showExpandedTodos + showSpinnerTree for backwards compat
+  // Maps the new unified expandedView enum to two legacy boolean config keys
+  // so that the user's panel visibility preference survives across sessions.
   if (newState.expandedView !== oldState.expandedView) {
     const showExpandedTodos = newState.expandedView === 'tasks'
     const showSpinnerTree = newState.expandedView === 'teammates'
@@ -127,7 +195,12 @@ export function onChangeAppState({
     }
   }
 
+  // =========================================================================
+  // 4. Verbose mode → globalConfig persistence
+  // =========================================================================
   // verbose
+  // Persist verbose toggle to globalConfig so it survives across sessions.
+  // Only writes if the config value is actually different (avoids unnecessary I/O).
   if (
     newState.verbose !== oldState.verbose &&
     getGlobalConfig().verbose !== newState.verbose
@@ -139,7 +212,12 @@ export function onChangeAppState({
     }))
   }
 
+  // =========================================================================
+  // 5. Tungsten panel visibility → globalConfig persistence (ant-only)
+  // =========================================================================
   // tungstenPanelVisible (ant-only tmux panel sticky toggle)
+  // Only persisted for internal (ant) users. The panel visibility preference
+  // is saved so the tmux panel opens/closes consistently across sessions.
   if (process.env.USER_TYPE === 'ant') {
     if (
       newState.tungstenPanelVisible !== oldState.tungstenPanelVisible &&
@@ -151,8 +229,17 @@ export function onChangeAppState({
     }
   }
 
+  // =========================================================================
+  // 6. Settings change → clear auth caches + re-apply env vars
+  // =========================================================================
   // settings: clear auth-related caches when settings change
   // This ensures apiKeyHelper and AWS/GCP credential changes take effect immediately
+  // When the settings object reference changes, it means the user (or a watcher)
+  // modified settings. We must:
+  //   a. Clear cached API key / AWS / GCP credentials so the next API call
+  //      picks up the new values.
+  //   b. If settings.env changed, re-apply environment variables to process.env.
+  //      This is additive-only: new vars added, existing overwritten, none deleted.
   if (newState.settings !== oldState.settings) {
     try {
       clearApiKeyHelperCache()

@@ -1,4 +1,32 @@
+// =============================================================================
+// commands.ts — The central command registry for Claude Code REPL.
+//
+// This module is the single source of truth for all slash commands (e.g. /help,
+// /compact, /config). It handles:
+//   1. Registering built-in commands (the COMMANDS() array)
+//   2. Loading external commands from skills directories, plugins, bundled
+//      skills, MCP servers, and workflow scripts
+//   3. Filtering commands by availability (auth/provider) and enablement
+//      (feature flags, env vars)
+//   4. Deduplicating commands when multiple sources define the same name
+//   5. Exposing helpers to find, filter, and format commands for the UI
+//
+// Commands come in three types (see types/command.ts):
+//   - PromptCommand (type: 'prompt')   — Expands into content sent to the model.
+//       Used by skills, custom prompts, and model-invocable commands.
+//   - LocalCommand (type: 'local')     — Runs locally, returns text/compact result.
+//       Used by commands like /compact, /cost that produce text output.
+//   - LocalJSXCommand (type: 'local-jsx') — Renders an Ink (React) TUI component.
+//       Used by interactive commands like /config, /mcp, /model that need UI.
+// =============================================================================
+
 // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
+
+// ---------------------------------------------------------------------------
+// Static command imports — each file exports a Command object defining
+// one slash command. These are always included in the build (not gated
+// behind feature flags). Organized alphabetically by import name.
+// ---------------------------------------------------------------------------
 import addDir from './commands/add-dir/index.js'
 import autofixPr from './commands/autofix-pr/index.js'
 import backfillSessions from './commands/backfill-sessions/index.js'
@@ -44,6 +72,13 @@ import skills from './commands/skills/index.js'
 import status from './commands/status/index.js'
 import tasks from './commands/tasks/index.js'
 import teleport from './commands/teleport/index.js'
+// ---------------------------------------------------------------------------
+// Conditionally-loaded command: agents-platform is only available for
+// internal Anthropic users (USER_TYPE === 'ant'). Uses require() instead
+// of import() so that Bun's bundler can tree-shake the module for external
+// builds. This pattern (conditional require at module scope) is used
+// throughout this file for build-time dead code elimination.
+// ---------------------------------------------------------------------------
 /* eslint-disable @typescript-eslint/no-require-imports */
 const agentsPlatform =
   process.env.USER_TYPE === 'ant'
@@ -57,70 +92,99 @@ import usage from './commands/usage/index.js'
 import theme from './commands/theme/index.js'
 import vim from './commands/vim/index.js'
 import { feature } from 'bun:bundle'
+// ---------------------------------------------------------------------------
+// Feature-gated command imports — these use Bun's `feature()` API for
+// build-time dead code elimination. When a feature flag is OFF in the build
+// config, the entire require() branch is eliminated from the bundle. This
+// keeps the binary lean by only including commands the build is configured for.
+//
+// Each command is loaded via require() (not import) so the bundler can
+// statically analyze and eliminate the dead branch. The result is either
+// the command module's default export or null.
+// ---------------------------------------------------------------------------
 // Dead code elimination: conditional imports
 /* eslint-disable @typescript-eslint/no-require-imports */
+// Proactive suggestions — enabled by PROACTIVE or KAIROS feature flag
 const proactive =
   feature('PROACTIVE') || feature('KAIROS')
     ? require('./commands/proactive.js').default
     : null
+// Brief mode — concise model output, part of the Kairos experience
 const briefCommand =
   feature('KAIROS') || feature('KAIROS_BRIEF')
     ? require('./commands/brief.js').default
     : null
+// Assistant mode — the Kairos AI assistant experience
 const assistantCommand = feature('KAIROS')
   ? require('./commands/assistant/index.js').default
   : null
+// Bridge mode — enables remote control of the REPL (e.g. from mobile/web)
 const bridge = feature('BRIDGE_MODE')
   ? require('./commands/bridge/index.js').default
   : null
+// Remote control server — requires both DAEMON and BRIDGE_MODE (serves bridge connections)
 const remoteControlServerCommand =
   feature('DAEMON') && feature('BRIDGE_MODE')
     ? require('./commands/remoteControlServer/index.js').default
     : null
+// Voice mode — speech-to-text input for the REPL
 const voiceCommand = feature('VOICE_MODE')
   ? require('./commands/voice/index.js').default
   : null
+// Force context snipping — manually triggers history truncation
 const forceSnip = feature('HISTORY_SNIP')
   ? require('./commands/force-snip.js').default
   : null
+// Workflow scripts — user-defined automation workflows loaded from .claude/workflows/
 const workflowsCmd = feature('WORKFLOW_SCRIPTS')
   ? (
       require('./commands/workflows/index.js') as typeof import('./commands/workflows/index.js')
     ).default
   : null
+// Remote setup (web) — CCR (Claude Code Remote) setup flow
 const webCmd = feature('CCR_REMOTE_SETUP')
   ? (
       require('./commands/remote-setup/index.js') as typeof import('./commands/remote-setup/index.js')
     ).default
   : null
+// Experimental skill search index cache — cleared when dynamic skills change
 const clearSkillIndexCache = feature('EXPERIMENTAL_SKILL_SEARCH')
   ? (
       require('./services/skillSearch/localSearch.js') as typeof import('./services/skillSearch/localSearch.js')
     ).clearSkillIndexCache
   : null
+// GitHub PR subscription via webhooks — Kairos GitHub integration
 const subscribePr = feature('KAIROS_GITHUB_WEBHOOKS')
   ? require('./commands/subscribe-pr.js').default
   : null
+// Ultra-plan — advanced planning mode for complex tasks
 const ultraplan = feature('ULTRAPLAN')
   ? require('./commands/ultraplan.js').default
   : null
+// Torch — experimental command
 const torch = feature('TORCH') ? require('./commands/torch.js').default : null
+// Peers — inter-process communication via Unix Domain Sockets
 const peersCmd = feature('UDS_INBOX')
   ? (
       require('./commands/peers/index.js') as typeof import('./commands/peers/index.js')
     ).default
   : null
+// Fork — spawn sub-agent processes for parallel work
 const forkCmd = feature('FORK_SUBAGENT')
   ? (
       require('./commands/fork/index.js') as typeof import('./commands/fork/index.js')
     ).default
   : null
+// Buddy — pair programming companion feature
 const buddy = feature('BUDDY')
   ? (
       require('./commands/buddy/index.js') as typeof import('./commands/buddy/index.js')
     ).default
   : null
 /* eslint-enable @typescript-eslint/no-require-imports */
+// ---------------------------------------------------------------------------
+// Additional static command imports (not feature-gated)
+// ---------------------------------------------------------------------------
 import thinkback from './commands/thinkback/index.js'
 import thinkbackPlay from './commands/thinkback-play/index.js'
 import permissions from './commands/permissions/index.js'
@@ -150,23 +214,36 @@ import sandboxToggle from './commands/sandbox-toggle/index.js'
 import chrome from './commands/chrome/index.js'
 import stickers from './commands/stickers/index.js'
 import advisor from './commands/advisor.js'
+// ---------------------------------------------------------------------------
+// Utility imports — logging, error handling, skill/plugin loading, auth, etc.
+// ---------------------------------------------------------------------------
 import { logError } from './utils/log.js'
 import { toError } from './utils/errors.js'
 import { logForDebugging } from './utils/debug.js'
+// Skill loading utilities:
+// - getSkillDirCommands: discovers skills from filesystem skill directories
+// - clearSkillCaches: invalidates all cached skill data
+// - getDynamicSkills: returns skills discovered dynamically during file operations
+//   (e.g. when the model touches files matching a skill's `paths` globs)
 import {
   getSkillDirCommands,
   clearSkillCaches,
   getDynamicSkills,
 } from './skills/loadSkillsDir.js'
+// Bundled skills are shipped with Claude Code itself (not loaded from disk)
 import { getBundledSkills } from './skills/bundledSkills.js'
+// Built-in plugin skills come from plugins that ship with Claude Code
 import { getBuiltinPluginSkillCommands } from './plugins/builtinPlugins.js'
+// Plugin commands and skills from user-installed plugins (loaded from disk)
 import {
   getPluginCommands,
   clearPluginCommandCache,
   getPluginSkills,
   clearPluginSkillsCache,
 } from './utils/plugins/loadPluginCommands.js'
+// lodash memoize — used to cache expensive command loading operations
 import memoize from 'lodash-es/memoize.js'
+// Auth utilities — used to gate commands by authentication/provider type
 import { isUsing3PServices, isClaudeAISubscriber } from './utils/auth.js'
 import { isFirstPartyAnthropicBaseUrl } from './utils/model/providers.js'
 import env from './commands/env/index.js'
@@ -187,6 +264,10 @@ import effort from './commands/effort/index.js'
 import stats from './commands/stats/index.js'
 // insights.ts is 113KB (3200 lines, includes diffLines/html rendering). Lazy
 // shim defers the heavy module until /insights is actually invoked.
+// This is a PromptCommand that acts as a thin proxy: it has all the metadata
+// needed for registration (name, description, source) but dynamically imports
+// the actual implementation only when getPromptForCommand() is called. This
+// avoids paying the ~113KB parse cost at startup for a rarely-used command.
 const usageReport: Command = {
   type: 'prompt',
   name: 'insights',
@@ -203,14 +284,20 @@ const usageReport: Command = {
 import oauthRefresh from './commands/oauth-refresh/index.js'
 import debugToolCall from './commands/debug-tool-call/index.js'
 import x402 from './commands/x402/index.js'
+// getSettingSourceName maps a SettingSource to a human-readable label for UI display
 import { getSettingSourceName } from './utils/settings/constants.js'
+// Core type and helper imports from the centralized command type definitions.
+// Command is the union type: CommandBase & (PromptCommand | LocalCommand | LocalJSXCommand)
+// getCommandName returns the user-visible name (cmd.userFacingName() ?? cmd.name)
+// isCommandEnabled returns cmd.isEnabled?.() ?? true
 import {
   type Command,
   getCommandName,
   isCommandEnabled,
 } from './types/command.js'
 
-// Re-export types from the centralized location
+// Re-export types from the centralized location so that other modules can
+// import them from either './commands.js' (legacy) or './types/command.js'
 export type {
   Command,
   CommandBase,
@@ -222,6 +309,16 @@ export type {
 } from './types/command.js'
 export { getCommandName, isCommandEnabled } from './types/command.js'
 
+// =============================================================================
+// INTERNAL_ONLY_COMMANDS — Commands restricted to internal Anthropic builds.
+//
+// These commands are included in internal builds (USER_TYPE === 'ant') but
+// stripped entirely from the external/public build. They include developer
+// tools (breakCache, mockLimits, heapDump), internal workflows (commit,
+// commitPushPr, autofixPr), and Anthropic-specific features (antTrace,
+// goodClaude, teleport). The .filter(Boolean) at the end removes any
+// feature-gated commands that resolved to null.
+// =============================================================================
 // Commands that get eliminated from the external build
 export const INTERNAL_ONLY_COMMANDS = [
   backfillSessions,
@@ -254,9 +351,37 @@ export const INTERNAL_ONLY_COMMANDS = [
   autofixPr,
 ].filter(Boolean)
 
+// =============================================================================
+// COMMANDS() — The master registry of all built-in slash commands.
+//
+// This is a memoized function (not a plain array) for two reasons:
+//   1. Some commands (e.g. login()) call functions that read from config,
+//      which isn't available at module initialization time
+//   2. Memoization ensures we only build the array once, then reuse it
+//
+// The array contains all three command types:
+//   - PromptCommand:     e.g. review, securityReview — expand to model prompts
+//   - LocalCommand:      e.g. compact, cost — run locally, return text
+//   - LocalJSXCommand:   e.g. config, mcp, model — render interactive TUI
+//
+// Feature-gated commands are spread with a ternary guard:
+//   ...(featureGatedCmd ? [featureGatedCmd] : [])
+// This ensures null commands (from disabled feature flags) are excluded.
+//
+// Auth-gated commands check at array-construction time:
+//   ...(!isUsing3PServices() ? [logout, login()] : [])
+// This means login/logout are only available for first-party auth users.
+//
+// Internal-only commands are appended at the end for Anthropic employees
+// only (USER_TYPE === 'ant' and not in demo mode).
+// =============================================================================
 // Declared as a function so that we don't run this until getCommands is called,
 // since underlying functions read from config, which can't be read at module initialization time
 const COMMANDS = memoize((): Command[] => [
+  // ---------------------------------------------------------------------------
+  // Always-available built-in commands (alphabetical)
+  // Each is an imported Command object from ./commands/<name>/index.js
+  // ---------------------------------------------------------------------------
   addDir,
   advisor,
   agents,
@@ -319,6 +444,10 @@ const COMMANDS = memoize((): Command[] => [
   usageReport,
   vim,
   x402,
+  // ---------------------------------------------------------------------------
+  // Feature-gated commands — included only when their feature flag is enabled.
+  // Each uses the spread-ternary pattern to conditionally include or exclude.
+  // ---------------------------------------------------------------------------
   ...(webCmd ? [webCmd] : []),
   ...(forkCmd ? [forkCmd] : []),
   ...(buddy ? [buddy] : []),
@@ -328,6 +457,10 @@ const COMMANDS = memoize((): Command[] => [
   ...(bridge ? [bridge] : []),
   ...(remoteControlServerCommand ? [remoteControlServerCommand] : []),
   ...(voiceCommand ? [voiceCommand] : []),
+  // ---------------------------------------------------------------------------
+  // More always-available commands (non-alphabetical — added after the
+  // feature-gated block for historical/organizational reasons)
+  // ---------------------------------------------------------------------------
   thinkback,
   thinkbackPlay,
   permissions,
@@ -336,22 +469,49 @@ const COMMANDS = memoize((): Command[] => [
   hooks,
   exportCommand,
   sandboxToggle,
+  // Auth-gated: login/logout are only available for first-party Anthropic users
+  // (not Bedrock/Vertex/Foundry third-party providers). login() is called as a
+  // function because it reads config at construction time.
   ...(!isUsing3PServices() ? [logout, login()] : []),
   passes,
   ...(peersCmd ? [peersCmd] : []),
   tasks,
   ...(workflowsCmd ? [workflowsCmd] : []),
   ...(torch ? [torch] : []),
+  // Internal-only: all INTERNAL_ONLY_COMMANDS are appended for Anthropic
+  // employees (USER_TYPE === 'ant') unless running in demo mode.
   ...(process.env.USER_TYPE === 'ant' && !process.env.IS_DEMO
     ? INTERNAL_ONLY_COMMANDS
     : []),
 ])
 
+// builtInCommandNames — A memoized Set of all built-in command names (including aliases).
+// Used during deduplication in getCommands() to determine which commands in the
+// merged list come from COMMANDS() vs. external sources (skills, plugins).
+// This ensures that when inserting dynamic skills, they are placed before
+// built-in commands in priority order.
 export const builtInCommandNames = memoize(
   (): Set<string> =>
     new Set(COMMANDS().flatMap(_ => [_.name, ...(_.aliases ?? [])])),
 )
 
+// =============================================================================
+// getSkills() — Aggregates skills from all four skill sources.
+//
+// Skill sources (in order of loading):
+//   1. skillDirCommands — Skills discovered from filesystem skill directories
+//      (e.g. ~/.claude/skills/, .claude/skills/ in the project). These are
+//      PromptCommand objects loaded from SKILL.md files by getSkillDirCommands().
+//   2. pluginSkills — Skills contributed by user-installed plugins. Loaded
+//      asynchronously from plugin manifests.
+//   3. bundledSkills — Skills that ship with Claude Code itself. Registered
+//      synchronously at startup (no async I/O).
+//   4. builtinPluginSkills — Skills from plugins that are built into Claude
+//      Code (as opposed to user-installed plugins).
+//
+// Each source is loaded with error isolation: if one source fails, the others
+// still load successfully (defensive catch blocks log errors and return []).
+// =============================================================================
 async function getSkills(cwd: string): Promise<{
   skillDirCommands: Command[]
   pluginSkills: Command[]
@@ -359,6 +519,8 @@ async function getSkills(cwd: string): Promise<{
   builtinPluginSkills: Command[]
 }> {
   try {
+    // Load skill directories and plugin skills in parallel for speed.
+    // Each has its own .catch() so a failure in one doesn't block the other.
     const [skillDirCommands, pluginSkills] = await Promise.all([
       getSkillDirCommands(cwd).catch(err => {
         logError(toError(err))
@@ -399,6 +561,9 @@ async function getSkills(cwd: string): Promise<{
   }
 }
 
+// Feature-gated workflow command loader — discovers workflow scripts from
+// .claude/workflows/ directories and creates PromptCommand objects for each.
+// Only available when WORKFLOW_SCRIPTS feature flag is enabled.
 /* eslint-disable @typescript-eslint/no-require-imports */
 const getWorkflowCommands = feature('WORKFLOW_SCRIPTS')
   ? (
@@ -417,10 +582,14 @@ const getWorkflowCommands = feature('WORKFLOW_SCRIPTS')
  * so this must be re-evaluated on every getCommands() call.
  */
 export function meetsAvailabilityRequirement(cmd: Command): boolean {
+  // Commands without an availability restriction are universally available
   if (!cmd.availability) return true
+  // Check if the user matches at least ONE of the listed availability types.
+  // This is an OR check — matching any single type is sufficient.
   for (const a of cmd.availability) {
     switch (a) {
       case 'claude-ai':
+        // User is authenticated via claude.ai OAuth (Pro/Max/Team/Enterprise)
         if (isClaudeAISubscriber()) return true
         break
       case 'console':
@@ -435,12 +604,14 @@ export function meetsAvailabilityRequirement(cmd: Command): boolean {
           return true
         break
       default: {
+        // Exhaustive type check — ensures new CommandAvailability values are handled
         const _exhaustive: never = a
         void _exhaustive
         break
       }
     }
   }
+  // No availability type matched — command is not available to this user
   return false
 }
 
@@ -449,6 +620,10 @@ export function meetsAvailabilityRequirement(cmd: Command): boolean {
  * because loading is expensive (disk I/O, dynamic imports).
  */
 const loadAllCommands = memoize(async (cwd: string): Promise<Command[]> => {
+  // Load all three command sources in parallel:
+  //   1. getSkills(cwd) — skill directories, plugin skills, bundled skills, builtin plugin skills
+  //   2. getPluginCommands() — slash commands contributed by user-installed plugins
+  //   3. getWorkflowCommands(cwd) — workflow scripts from .claude/workflows/ (if enabled)
   const [
     { skillDirCommands, pluginSkills, bundledSkills, builtinPluginSkills },
     pluginCommands,
@@ -459,6 +634,16 @@ const loadAllCommands = memoize(async (cwd: string): Promise<Command[]> => {
     getWorkflowCommands ? getWorkflowCommands(cwd) : Promise.resolve([]),
   ])
 
+  // Merge all command sources into a single array. The order matters for
+  // deduplication and priority — earlier entries take precedence when names
+  // collide during filtering. The ordering is:
+  //   1. bundledSkills (highest priority — shipped with Claude Code)
+  //   2. builtinPluginSkills (from built-in plugins)
+  //   3. skillDirCommands (from filesystem skill directories)
+  //   4. workflowCommands (from .claude/workflows/)
+  //   5. pluginCommands (from user-installed plugins)
+  //   6. pluginSkills (skills from user-installed plugins)
+  //   7. COMMANDS() (built-in commands — lowest priority, always present)
   return [
     ...bundledSkills,
     ...builtinPluginSkills,
@@ -476,20 +661,33 @@ const loadAllCommands = memoize(async (cwd: string): Promise<Command[]> => {
  * auth changes (e.g. /login) take effect immediately.
  */
 export async function getCommands(cwd: string): Promise<Command[]> {
+  // Step 1: Get the full merged command list (memoized — fast after first call)
   const allCommands = await loadAllCommands(cwd)
 
+  // Step 2: Get dynamic skills — these are skills discovered lazily during
+  // file operations when the model touches files matching a skill's `paths`
+  // globs. They're not in loadAllCommands because they appear mid-session.
+  // getDynamicSkills() returns an array from an in-memory cache that is
+  // populated by the skill activation system.
   // Get dynamic skills discovered during file operations
   const dynamicSkills = getDynamicSkills()
 
+  // Step 3: Filter base commands by availability (auth/provider) AND enablement
+  // (feature flags, env vars). These two checks are NOT memoized because auth
+  // state can change mid-session (e.g. after /login or /logout).
   // Build base commands without dynamic skills
   const baseCommands = allCommands.filter(
     _ => meetsAvailabilityRequirement(_) && isCommandEnabled(_),
   )
 
+  // Fast path: no dynamic skills to merge, return filtered base commands
   if (dynamicSkills.length === 0) {
     return baseCommands
   }
 
+  // Step 4: Deduplicate dynamic skills — only include skills whose name
+  // isn't already in the base command list. Also apply the same availability
+  // and enablement filters.
   // Dedupe dynamic skills - only add if not already present
   const baseCommandNames = new Set(baseCommands.map(c => c.name))
   const uniqueDynamicSkills = dynamicSkills.filter(
@@ -499,18 +697,28 @@ export async function getCommands(cwd: string): Promise<Command[]> {
       isCommandEnabled(s),
   )
 
+  // After deduplication, no new skills to add
   if (uniqueDynamicSkills.length === 0) {
     return baseCommands
   }
 
+  // Step 5: Insert dynamic skills at the right position in the command list.
+  // They go AFTER plugin/skill commands but BEFORE built-in commands. This
+  // ensures dynamic skills appear in typeahead between external and built-in
+  // commands. We find the insertion point by locating the first built-in
+  // command in the filtered list.
   // Insert dynamic skills after plugin skills but before built-in commands
   const builtInNames = new Set(COMMANDS().map(c => c.name))
   const insertIndex = baseCommands.findIndex(c => builtInNames.has(c.name))
 
+  // Fallback: if no built-in commands are in the list (shouldn't happen),
+  // append dynamic skills at the end
   if (insertIndex === -1) {
     return [...baseCommands, ...uniqueDynamicSkills]
   }
 
+  // Splice dynamic skills into the command list at the insertion point:
+  // [external commands...] [dynamic skills...] [built-in commands...]
   return [
     ...baseCommands.slice(0, insertIndex),
     ...uniqueDynamicSkills,
@@ -523,6 +731,8 @@ export async function getCommands(cwd: string): Promise<Command[]> {
  * Use this when dynamic skills are added to invalidate cached command lists.
  */
 export function clearCommandMemoizationCaches(): void {
+  // Clear the memoized results of loadAllCommands, getSkillToolCommands,
+  // and getSlashCommandToolSkills so the next call re-fetches from sources
   loadAllCommands.cache?.clear?.()
   getSkillToolCommands.cache?.clear?.()
   getSlashCommandToolSkills.cache?.clear?.()
@@ -533,10 +743,16 @@ export function clearCommandMemoizationCaches(): void {
   clearSkillIndexCache?.()
 }
 
+// clearCommandsCache() — Full cache clear: memoization caches AND underlying
+// skill/plugin data caches. Used when the user runs /reload-plugins or when
+// skill directories change on disk. This is the "nuclear option" that forces
+// a complete re-discovery of all commands from all sources.
 export function clearCommandsCache(): void {
   clearCommandMemoizationCaches()
+  // Clear plugin command/skill caches (forces re-reading plugin manifests)
   clearPluginCommandCache()
   clearPluginSkillsCache()
+  // Clear skill directory caches (forces re-scanning SKILL.md files from disk)
   clearSkillCaches()
 }
 
@@ -549,7 +765,12 @@ export function clearCommandsCache(): void {
 export function getMcpSkillCommands(
   mcpCommands: readonly Command[],
 ): readonly Command[] {
+  // Only filter MCP commands when the MCP_SKILLS feature is enabled
   if (feature('MCP_SKILLS')) {
+    // Include only MCP-provided skills that are:
+    //   - PromptCommand (type: 'prompt') — expands to model content
+    //   - Loaded from MCP (loadedFrom: 'mcp')
+    //   - Model-invocable (disableModelInvocation is not set)
     return mcpCommands.filter(
       cmd =>
         cmd.type === 'prompt' &&
@@ -560,6 +781,19 @@ export function getMcpSkillCommands(
   return []
 }
 
+// =============================================================================
+// getSkillToolCommands() — Returns all PromptCommands that the model can invoke
+// via the SkillTool. This is the superset: skills + model-invocable commands.
+//
+// Inclusion criteria (ALL must be true):
+//   1. type === 'prompt' — only PromptCommands (not local/local-jsx)
+//   2. !disableModelInvocation — not explicitly blocked from model use
+//   3. source !== 'builtin' — excludes core built-in commands (like /help)
+//   4. Has a description or whenToUse — plugin/MCP commands need explicit
+//      descriptions; skills from /skills/ dirs get auto-derived descriptions
+//
+// Memoized by cwd for performance.
+// =============================================================================
 // SkillTool shows ALL prompt-based commands that the model can invoke
 // This includes both skills (from /skills/) and commands (from /commands/)
 export const getSkillToolCommands = memoize(
@@ -582,6 +816,19 @@ export const getSkillToolCommands = memoize(
   },
 )
 
+// =============================================================================
+// getSlashCommandToolSkills() — Returns only "true skills" for the
+// SlashCommandTool. Unlike getSkillToolCommands() which includes both skills
+// and model-invocable commands, this focuses on skills specifically.
+//
+// The key distinction: skills are commands that are loaded from skill
+// directories ('skills'), plugins ('plugin'), or bundled ('bundled'), OR
+// commands that have disableModelInvocation set (user-only slash commands
+// that should appear in the /skills listing but not in SkillTool).
+//
+// Must have description or whenToUse to be included (quality gate).
+// Gracefully returns [] on failure to avoid breaking the system.
+// =============================================================================
 // Filters commands to include only skills. Skills are commands that provide
 // specialized capabilities for the model to use. They are identified by
 // loadedFrom being 'skills', 'plugin', or 'bundled', or having disableModelInvocation set.
@@ -608,6 +855,14 @@ export const getSlashCommandToolSkills = memoize(
     }
   },
 )
+
+// =============================================================================
+// Remote and Bridge Safety — Allowlists for restricted execution contexts.
+//
+// When Claude Code runs in remote mode (--remote) or receives commands over
+// the bridge (from mobile/web), only a subset of commands are safe to execute.
+// These Sets define which commands are allowed in each context.
+// =============================================================================
 
 /**
  * Commands that are safe to use in remote mode (--remote).
@@ -672,8 +927,11 @@ export const BRIDGE_SAFE_COMMANDS: Set<Command> = new Set(
  * BRIDGE_SAFE_COMMANDS; 'local-jsx' commands render Ink UI and stay blocked.
  */
 export function isBridgeSafeCommand(cmd: Command): boolean {
+  // local-jsx commands render Ink UI in the terminal — never safe over bridge
   if (cmd.type === 'local-jsx') return false
+  // prompt commands expand to text sent to the model — always safe
   if (cmd.type === 'prompt') return true
+  // local commands must be explicitly listed in BRIDGE_SAFE_COMMANDS
   return BRIDGE_SAFE_COMMANDS.has(cmd)
 }
 
@@ -687,6 +945,18 @@ export function filterCommandsForRemoteMode(commands: Command[]): Command[] {
   return commands.filter(cmd => REMOTE_SAFE_COMMANDS.has(cmd))
 }
 
+// =============================================================================
+// Command lookup utilities — findCommand, hasCommand, getCommand
+//
+// These functions search for a command by name within a given command list.
+// They match against three identifiers:
+//   1. cmd.name — the internal name (e.g. 'compact')
+//   2. getCommandName(cmd) — the user-facing name (may differ if userFacingName is set)
+//   3. cmd.aliases — alternative names (e.g. 'c' for 'compact')
+// =============================================================================
+
+// findCommand — Looks up a command by name, user-facing name, or alias.
+// Returns undefined if no match is found (safe for optional chaining).
 export function findCommand(
   commandName: string,
   commands: Command[],
@@ -699,13 +969,18 @@ export function findCommand(
   )
 }
 
+// hasCommand — Boolean check: does a command with this name exist?
 export function hasCommand(commandName: string, commands: Command[]): boolean {
   return findCommand(commandName, commands) !== undefined
 }
 
+// getCommand — Strict lookup: throws ReferenceError with a helpful message
+// listing all available commands if the requested command is not found.
+// Used in code paths where the command MUST exist (e.g. after user selection).
 export function getCommand(commandName: string, commands: Command[]): Command {
   const command = findCommand(commandName, commands)
   if (!command) {
+    // Build a sorted, human-readable list of available commands with aliases
     throw ReferenceError(
       `Command ${commandName} not found. Available commands: ${commands
         .map(_ => {
@@ -728,14 +1003,17 @@ export function getCommand(commandName: string, commands: Command[]): Command {
  * For model-facing prompts (like SkillTool), use cmd.description directly.
  */
 export function formatDescriptionWithSource(cmd: Command): string {
+  // Non-prompt commands (local, local-jsx) don't have source annotations
   if (cmd.type !== 'prompt') {
     return cmd.description
   }
 
+  // Workflow-backed commands get a "(workflow)" badge
   if (cmd.kind === 'workflow') {
     return `${cmd.description} (workflow)`
   }
 
+  // Plugin commands show the plugin name if available, otherwise "(plugin)"
   if (cmd.source === 'plugin') {
     const pluginName = cmd.pluginInfo?.pluginManifest.name
     if (pluginName) {
@@ -744,14 +1022,19 @@ export function formatDescriptionWithSource(cmd: Command): string {
     return `${cmd.description} (plugin)`
   }
 
+  // Built-in and MCP commands don't need source annotation — they're the default
   if (cmd.source === 'builtin' || cmd.source === 'mcp') {
     return cmd.description
   }
 
+  // Bundled skills get a "(bundled)" badge
   if (cmd.source === 'bundled') {
     return `${cmd.description} (bundled)`
   }
 
+  // All other sources (project, user, etc.) use the human-readable source name
+  // from getSettingSourceName() which maps SettingSource to labels like
+  // "project settings", "user settings", etc.
   return `${cmd.description} (${getSettingSourceName(cmd.source)})`
 }
 

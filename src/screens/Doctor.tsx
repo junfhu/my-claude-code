@@ -1,59 +1,129 @@
+// =============================================================================
+// Doctor.tsx — Diagnostics Screen
+// =============================================================================
+// The /doctor command screen. Performs comprehensive environment checks and
+// displays results in a structured diagnostic report. Checks include:
+//   - Installation type (native, npm, global) and version info
+//   - Multiple installation detection (warns about conflicting installs)
+//   - Search tool (ripgrep) status (embedded/bundled/system)
+//   - Auto-update configuration and permissions
+//   - Environment variable validation (BASH_MAX_OUTPUT_LENGTH, etc.)
+//   - MCP server configuration parsing errors
+//   - Keybinding configuration warnings
+//   - Sandbox configuration status
+//   - Agent definition parse errors
+//   - Plugin errors
+//   - Context usage warnings (CLAUDE.md size, agent context, MCP tool count)
+//   - Version lock status (PID-based locking for concurrent instances)
+//   - Settings validation errors
+//
+// All checks run asynchronously on mount via useEffect. Results are displayed
+// in a scrollable Pane with a "Press Enter to continue" dismissal.
+// =============================================================================
 import { c as _c } from "react/compiler-runtime";
 import figures from 'figures';
 import { join } from 'path';
 import React, { Suspense, use, useCallback, useEffect, useMemo, useState } from 'react';
+// Displays warnings about keybinding configuration issues (conflicts, invalid keys)
 import { KeybindingWarnings } from 'src/components/KeybindingWarnings.js';
+// Displays warnings about MCP server configuration parsing failures
 import { McpParsingWarnings } from 'src/components/mcp/McpParsingWarnings.js';
+// Gets the maximum output token limit for a given model
 import { getModelMaxOutputTokens } from 'src/utils/context.js';
+// Gets the Claude config home directory (~/.claude or custom via env)
 import { getClaudeConfigHomeDir } from 'src/utils/envUtils.js';
 import type { SettingSource } from 'src/utils/settings/constants.js';
+// Gets the original working directory from which Claude Code was launched
 import { getOriginalCwd } from '../bootstrap/state.js';
 import type { CommandResultDisplay } from '../commands.js';
+// Pane: a bordered container component for grouping diagnostic sections
 import { Pane } from '../components/design-system/Pane.js';
+// PressEnterToContinue: simple component that waits for Enter key to dismiss
 import { PressEnterToContinue } from '../components/PressEnterToContinue.js';
+// Sandbox doctor section: displays sandbox configuration and status
 import { SandboxDoctorSection } from '../components/sandbox/SandboxDoctorSection.js';
+// Renders a list of settings validation errors
 import { ValidationErrorsList } from '../components/ValidationErrorsList.js';
+// Hook that collects settings validation errors across all config sources
 import { useSettingsErrors } from '../hooks/notifs/useSettingsErrors.js';
+// Hook to exit on Ctrl+C/D with proper keybinding integration
 import { useExitOnCtrlCDWithKeybindings } from '../hooks/useExitOnCtrlCDWithKeybindings.js';
+// Core Ink primitives for terminal UI layout and text rendering
 import { Box, Text } from '../ink.js';
+// Keybinding registration hook — registers Enter/Escape to dismiss the doctor screen
 import { useKeybindings } from '../keybindings/useKeybinding.js';
+// App state access for reading agent definitions, MCP tools, permissions, and plugin errors
 import { useAppState } from '../state/AppState.js';
+// Gets human-readable error messages from plugin error objects
 import { getPluginErrorMessage } from '../types/plugin.js';
+// Fetches available version dist-tags from GCS (native installs) or npm registry
 import { getGcsDistTags, getNpmDistTags, type NpmDistTags } from '../utils/autoUpdater.js';
+// Checks for context usage warnings (CLAUDE.md too large, too many agents, etc.)
 import { type ContextWarnings, checkContextWarnings } from '../utils/doctorContextWarnings.js';
+// Core diagnostic info gathering: installation type, version, paths, search status, etc.
 import { type DiagnosticInfo, getDoctorDiagnostic } from '../utils/doctorDiagnostic.js';
+// Validates bounded integer environment variables (checks range, type, etc.)
 import { validateBoundedIntEnvVar } from '../utils/envValidation.js';
 import { pathExists } from '../utils/file.js';
+// PID-based version locking: prevents conflicting concurrent version upgrades
 import { cleanupStaleLocks, getAllLockInfo, isPidBasedLockingEnabled, type LockInfo } from '../utils/nativeInstaller/pidLock.js';
+// Reads initial settings to determine auto-update channel preference
 import { getInitialSettings } from '../utils/settings/settings.js';
+// Default and upper limits for bash/task output length configuration
 import { BASH_MAX_OUTPUT_DEFAULT, BASH_MAX_OUTPUT_UPPER_LIMIT } from '../utils/shell/outputLimits.js';
 import { TASK_MAX_OUTPUT_DEFAULT, TASK_MAX_OUTPUT_UPPER_LIMIT } from '../utils/task/outputFormatting.js';
+// XDG state home directory for lock file storage
 import { getXDGStateHome } from '../utils/xdg.js';
+
+// Props for the Doctor screen component
+// onDone: callback invoked when the user dismisses the diagnostics screen
+// (result string is shown as a system message in the REPL)
 type Props = {
   onDone: (result?: string, options?: {
     display?: CommandResultDisplay;
   }) => void;
 };
+
+// Information about configured agents (custom agent definitions)
+// Used to display agent configuration status in the diagnostics report
 type AgentInfo = {
+  // List of currently active agents with their type and configuration source
   activeAgents: Array<{
     agentType: string;
     source: SettingSource | 'built-in' | 'plugin';
   }>;
+  // Path to user-level agents directory (~/.claude/agents)
   userAgentsDir: string;
+  // Path to project-level agents directory (.claude/agents)
   projectAgentsDir: string;
+  // Whether the user agents directory exists on disk
   userDirExists: boolean;
+  // Whether the project agents directory exists on disk
   projectDirExists: boolean;
+  // Agent files that failed to parse (syntax errors, invalid schema, etc.)
   failedFiles?: Array<{
     path: string;
     error: string;
   }>;
 };
+
+// Version lock information for the PID-based locking system
+// Prevents concurrent Claude Code instances from conflicting during updates
 type VersionLockInfo = {
+  // Whether PID-based locking is enabled in this installation
   enabled: boolean;
+  // Currently active version locks (one per running instance)
   locks: LockInfo[];
+  // Directory where lock files are stored
   locksDir: string;
+  // Number of stale locks that were cleaned up on this check
   staleLocksCleaned: number;
 };
+
+// ─── DistTagsDisplay Component ───────────────────────────────────────────────
+// Suspense-compatible component that displays the latest and stable version
+// dist-tags fetched from the npm registry or GCS. Uses React's `use()` hook
+// to unwrap the promise, suspending until the fetch completes.
 function DistTagsDisplay(t0) {
   const $ = _c(8);
   const {
@@ -97,15 +167,30 @@ function DistTagsDisplay(t0) {
   }
   return t3;
 }
+
+// ─── Doctor Component ────────────────────────────────────────────────────────
+// Main diagnostics screen component. On mount, it:
+//   1. Calls getDoctorDiagnostic() to gather installation info
+//   2. Scans agent directories for active agents and parse errors
+//   3. Runs checkContextWarnings() for CLAUDE.md/agent/MCP size warnings
+//   4. Checks PID-based version locks for stale lock cleanup
+//   5. Validates environment variables against expected ranges
+//   6. Fetches remote dist-tags to show available updates
+//
+// The React Compiler (_c cache array) handles memoization automatically —
+// the $[] array is the compiler's memo cache, and Symbol.for("react.memo_cache_sentinel")
+// marks values that should be computed exactly once.
 export function Doctor(t0) {
   const $ = _c(84);
   const {
     onDone
   } = t0;
+  // Read app state selectors for agent definitions, MCP tools, permissions, and plugin errors
   const agentDefinitions = useAppState(_temp);
   const mcpTools = useAppState(_temp2);
   const toolPermissionContext = useAppState(_temp3);
   const pluginsErrors = useAppState(_temp4);
+  // Allow ctrl+c/ctrl+d to exit the doctor screen
   useExitOnCtrlCDWithKeybindings();
   let t1;
   if ($[0] !== mcpTools) {
@@ -115,11 +200,17 @@ export function Doctor(t0) {
   } else {
     t1 = $[1];
   }
+  // Normalize MCP tools to an empty array if none are configured
   const tools = t1;
+  // Diagnostic state: populated asynchronously by getDoctorDiagnostic()
   const [diagnostic, setDiagnostic] = useState(null);
+  // Agent info state: populated by scanning agent directories
   const [agentInfo, setAgentInfo] = useState(null);
+  // Context warnings: populated by checkContextWarnings() (CLAUDE.md size, etc.)
   const [contextWarnings, setContextWarnings] = useState(null);
+  // Version lock info: populated by checking PID-based locks
   const [versionLockInfo, setVersionLockInfo] = useState(null);
+  // Settings validation errors (invalid config values, type mismatches, etc.)
   const validationErrors = useSettingsErrors();
   let t2;
   if ($[2] === Symbol.for("react.memo_cache_sentinel")) {
@@ -128,7 +219,10 @@ export function Doctor(t0) {
   } else {
     t2 = $[2];
   }
+  // Fetch dist-tags once on mount (Promise stored in ref for Suspense)
+  // Determines whether to use GCS or npm based on installation type
   const distTagsPromise = t2;
+  // Read auto-update channel preference from settings (defaults to "latest")
   const autoUpdatesChannel = getInitialSettings()?.autoUpdatesChannel ?? "latest";
   let t3;
   if ($[3] !== validationErrors) {
@@ -138,9 +232,13 @@ export function Doctor(t0) {
   } else {
     t3 = $[4];
   }
+  // Filter out MCP-specific errors (displayed separately by McpParsingWarnings)
   const errorsExcludingMcp = t3;
   let t4;
   if ($[5] === Symbol.for("react.memo_cache_sentinel")) {
+    // Validate key environment variables against their expected ranges.
+    // Each env var has a default value and an upper limit; validateBoundedIntEnvVar
+    // checks if the current value is valid, capped, or out-of-range.
     const envVars = [{
       name: "BASH_MAX_OUTPUT_LENGTH",
       default: BASH_MAX_OUTPUT_DEFAULT,
@@ -158,13 +256,18 @@ export function Doctor(t0) {
   } else {
     t4 = $[5];
   }
+  // Filter out env vars that passed validation (only show issues)
   const envValidationErrors = t4;
   let t5;
   let t6;
   if ($[6] !== agentDefinitions || $[7] !== toolPermissionContext || $[8] !== tools) {
+    // Main diagnostic useEffect — runs all async checks when dependencies change.
+    // Dependencies: toolPermissionContext, tools, agentDefinitions
     t5 = () => {
+      // 1. Gather core diagnostic info (version, installation type, ripgrep, etc.)
       getDoctorDiagnostic().then(setDiagnostic);
       (async () => {
+        // 2. Check agent directories and build agent info
         const userAgentsDir = join(getClaudeConfigHomeDir(), "agents");
         const projectAgentsDir = join(getOriginalCwd(), ".claude", "agents");
         const {
@@ -182,12 +285,14 @@ export function Doctor(t0) {
           failedFiles
         };
         setAgentInfo(agentInfoData);
+        // 3. Check for context usage warnings (large CLAUDE.md, too many agents/MCP tools)
         const warnings = await checkContextWarnings(tools, {
           activeAgents,
           allAgents,
           failedFiles
         }, async () => toolPermissionContext);
         setContextWarnings(warnings);
+        // 4. Check version locks — clean up stale locks from crashed instances
         if (isPidBasedLockingEnabled()) {
           const locksDir = join(getXDGStateHome(), "claude", "locks");
           const staleLocksCleaned = cleanupStaleLocks(locksDir);
@@ -219,6 +324,7 @@ export function Doctor(t0) {
     t6 = $[10];
   }
   useEffect(t5, t6);
+  // Dismiss handler — returns a system message to the REPL when user presses Enter/Escape
   let t7;
   if ($[11] !== onDone) {
     t7 = () => {
@@ -232,6 +338,7 @@ export function Doctor(t0) {
     t7 = $[12];
   }
   const handleDismiss = t7;
+  // Register keybindings: both Enter (confirm:yes) and Escape (confirm:no) dismiss the screen
   let t8;
   if ($[13] !== handleDismiss) {
     t8 = {
@@ -253,6 +360,7 @@ export function Doctor(t0) {
     t9 = $[15];
   }
   useKeybindings(t8, t9);
+  // Show loading state until diagnostic info is gathered
   if (!diagnostic) {
     let t10;
     if ($[16] === Symbol.for("react.memo_cache_sentinel")) {
@@ -263,6 +371,9 @@ export function Doctor(t0) {
     }
     return t10;
   }
+  // ─── Render: Diagnostics Section ──────────────────────────────────────────
+  // Displays: version, installation type, package manager, path, binary,
+  // config install method, search (ripgrep) status
   let t10;
   if ($[17] === Symbol.for("react.memo_cache_sentinel")) {
     t10 = <Text bold={true}>Diagnostics</Text>;
@@ -311,6 +422,7 @@ export function Doctor(t0) {
   } else {
     t15 = $[28];
   }
+  // Ripgrep status: "OK" or "Not working", with mode (bundled/vendor/system path)
   const t16 = diagnostic.ripgrepStatus.working ? "OK" : "Not working";
   const t17 = diagnostic.ripgrepStatus.mode === "embedded" ? "bundled" : diagnostic.ripgrepStatus.mode === "builtin" ? "vendor" : diagnostic.ripgrepStatus.systemPath || "system";
   let t18;
@@ -371,6 +483,8 @@ export function Doctor(t0) {
   } else {
     t23 = $[50];
   }
+  // ─── Render: Updates Section ────────────────────────────────────────────
+  // Auto-update status, permissions, channel, and available versions
   let t24;
   if ($[51] === Symbol.for("react.memo_cache_sentinel")) {
     t24 = <Text bold={true}>Updates</Text>;
@@ -500,45 +614,64 @@ export function Doctor(t0) {
   }
   return t41;
 }
+
+// ─── Helper Functions ────────────────────────────────────────────────────────
+// These are React Compiler-extracted callback functions used in .map() and
+// .filter() calls above. The compiler hoists them to module scope to avoid
+// creating new function instances on every render.
+
+// Renders an MCP warning detail line
 function _temp18(detail_2, i_8) {
   return <Text key={i_8} dimColor={true}>{"    "}└ {detail_2}</Text>;
 }
+// Renders an agent warning detail line
 function _temp17(detail_1, i_7) {
   return <Text key={i_7} dimColor={true}>{"    "}└ {detail_1}</Text>;
 }
+// Renders a CLAUDE.md warning detail line
 function _temp16(detail_0, i_6) {
   return <Text key={i_6} dimColor={true}>{"    "}└ {detail_0}</Text>;
 }
+// Renders an unreachable permission rule detail line
 function _temp15(detail, i_5) {
   return <Text key={i_5} dimColor={true}>{"  "}└ {detail}</Text>;
 }
+// Renders a plugin error line with source and error message
 function _temp14(error_0, i_4) {
   return <Text key={i_4} dimColor={true}>{"  "}└ {error_0.source || "unknown"}{"plugin" in error_0 && error_0.plugin ? ` [${error_0.plugin}]` : ""}:{" "}{getPluginErrorMessage(error_0)}</Text>;
 }
+// Renders a failed agent file parse error line
 function _temp13(file, i_3) {
   return <Text key={i_3} dimColor={true}>{"  "}└ {file.path}: {file.error}</Text>;
 }
+// Renders a version lock entry with PID and running/stale status
 function _temp12(lock, i_2) {
   return <Text key={i_2}>└ {lock.version}: PID {lock.pid}{" "}{lock.isProcessRunning ? <Text>(running)</Text> : <Text color="warning">(stale)</Text>}</Text>;
 }
+// Renders an environment variable validation result line
 function _temp11(validation, i_1) {
   return <Text key={i_1}>└ {validation.name}:{" "}<Text color={validation.status === "capped" ? "warning" : "error"}>{validation.message}</Text></Text>;
 }
+// Renders a diagnostic warning with issue description and fix suggestion
 function _temp10(warning, i_0) {
   return <Box key={i_0} flexDirection="column"><Text color="warning">Warning: {warning.issue}</Text><Text>Fix: {warning.fix}</Text></Box>;
 }
+// Renders a multiple-installation entry line
 function _temp1(install, i) {
   return <Text key={i}>└ {install.type} at {install.path}</Text>;
 }
+// Maps an agent definition to a simplified { agentType, source } object
 function _temp0(a) {
   return {
     agentType: a.agentType,
     source: a.source
   };
 }
+// Filter: excludes valid env var validations (only shows issues)
 function _temp9(v_0) {
   return v_0.status !== "valid";
 }
+// Validates a single environment variable against its expected range
 function _temp8(v) {
   const value = process.env[v.name];
   const result = validateBoundedIntEnvVar(v.name, value, v.default, v.upperLimit);
@@ -547,28 +680,35 @@ function _temp8(v) {
     ...result
   };
 }
+// Filter: excludes MCP-specific validation errors (handled separately)
 function _temp7(error) {
   return error.mcpErrorMetadata === undefined;
 }
+// Fetches dist-tags: uses GCS for native installs, npm for npm installs
 function _temp6(diag) {
   const fetchDistTags = diag.installationType === "native" ? getGcsDistTags : getNpmDistTags;
   return fetchDistTags().catch(_temp5);
 }
+// Fallback for failed dist-tag fetch — returns null versions
 function _temp5() {
   return {
     latest: null,
     stable: null
   };
 }
+// App state selector: reads plugin errors from the plugins slice
 function _temp4(s_2) {
   return s_2.plugins.errors;
 }
+// App state selector: reads the tool permission context
 function _temp3(s_1) {
   return s_1.toolPermissionContext;
 }
+// App state selector: reads the list of MCP tools
 function _temp2(s_0) {
   return s_0.mcp.tools;
 }
+// App state selector: reads agent definitions (active, all, failed files)
 function _temp(s) {
   return s.agentDefinitions;
 }

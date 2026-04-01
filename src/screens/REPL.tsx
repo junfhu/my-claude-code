@@ -1,7 +1,31 @@
+// =============================================================================
+// REPL.tsx — Main interactive Read-Eval-Print Loop screen
+// =============================================================================
+// This is the central screen component for the Claude Code CLI. It orchestrates:
+//   1. The user prompt input loop (read user text → send to API → display response)
+//   2. Tool permission handling and sandbox integration
+//   3. Background task coordination (agents, teammates, swarm workers)
+//   4. Session management (resume, restore, cost tracking, transcript)
+//   5. Keybinding integration (global, command, voice, scroll bindings)
+//   6. Voice mode integration (conditional import for push-to-talk)
+//   7. Full-screen alternate-screen rendering with virtual scrolling
+//
+// The file is ~5,000 lines because it owns the entire REPL lifecycle:
+//   - Message state (conversation history, streaming responses)
+//   - Command processing (slash commands like /cost, /doctor, /compact)
+//   - Model query dispatch (via the `query` function)
+//   - File history snapshots for undo/rewind
+//   - Notification orchestration (install, rate-limit, deprecation, etc.)
+// =============================================================================
 import { c as _c } from "react/compiler-runtime";
 // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
+// Bun compile-time feature flags — enables dead-code elimination for features
+// like VOICE_MODE, COORDINATOR_MODE, PROACTIVE, etc. so unused modules are
+// tree-shaken from the external build.
 import { feature } from 'bun:bundle';
 import { spawnSync } from 'child_process';
+// Token budget tracking: snapshot/read output token counts per turn to enforce
+// per-turn token budgets and detect budget continuation (auto-continue) scenarios
 import { snapshotOutputTokensForTurn, getCurrentTurnTokenBudget, getTurnOutputTokens, getBudgetContinuationCount, getTotalInputTokens } from '../bootstrap/state.js';
 import { parseTokenBudget } from '../utils/tokenBudget.js';
 import { count } from '../utils/array.js';
@@ -9,101 +33,185 @@ import { dirname, join } from 'path';
 import { tmpdir } from 'os';
 import figures from 'figures';
 // eslint-disable-next-line custom-rules/prefer-use-keybindings -- / n N Esc [ v are bare letters in transcript modal context, same class as g/G/j/k in ScrollKeybindingHandler
+// useInput is the raw keystroke handler from the custom Ink fork — used here
+// for transcript modal navigation keys that can't go through the keybinding system
 import { useInput } from '../ink.js';
+// Hook for incremental search within the transcript (ctrl+f style filtering)
 import { useSearchInput } from '../hooks/useSearchInput.js';
+// Reactive terminal dimensions (columns × rows) — drives layout recalculations
 import { useTerminalSize } from '../hooks/useTerminalSize.js';
+// Provides search-match highlighting state for the Ink render pass
 import { useSearchHighlight } from '../ink/hooks/use-search-highlight.js';
+// JumpHandle allows programmatic scrolling to a specific message in the virtual list
 import type { JumpHandle } from '../components/VirtualMessageList.js';
+// Exports the entire conversation to plain text (for /export command)
 import { renderMessagesToPlainText } from '../utils/exportRenderer.js';
+// Opens a temp file in $EDITOR for multi-line prompt editing (ctrl+g / ctrl+x ctrl+e)
 import { openFileInExternalEditor } from '../utils/editor.js';
 import { writeFile } from 'fs/promises';
+// Core Ink primitives — Box/Text for terminal layout, hooks for stdin, theming,
+// terminal focus/blur detection, tab title, and tab status badge
 import { Box, Text, useStdin, useTheme, useTerminalFocus, useTerminalTitle, useTabStatus } from '../ink.js';
 import type { TabStatusKind } from '../ink/hooks/use-tab-status.js';
+// Modal dialog shown when accumulated API costs exceed a configurable threshold
 import { CostThresholdDialog } from '../components/CostThresholdDialog.js';
+// Modal dialog shown when the user returns after an idle timeout
 import { IdleReturnDialog } from '../components/IdleReturnDialog.js';
 import * as React from 'react';
 import { useEffect, useMemo, useRef, useState, useCallback, useDeferredValue, useLayoutEffect, type RefObject } from 'react';
+// Notification context — manages the queue of in-app notification banners
 import { useNotifications } from '../context/notifications.js';
+// OS-level notifications (macOS Notification Center, etc.) for background completion
 import { sendNotification } from '../services/notifier.js';
+// Prevent macOS sleep while a long-running agent task is active
 import { startPreventSleep, stopPreventSleep } from '../services/preventSleep.js';
+// Terminal bell / flash notification hook
 import { useTerminalNotification } from '../ink/useTerminalNotification.js';
+// Detects a specific terminal bug where cursor-up in viewport triggers a yank
 import { hasCursorUpViewportYankBug } from '../ink/terminal.js';
+// LRU-bounded cache of file contents read during the session — used to detect
+// file modifications and provide context for tool permissions
 import { createFileStateCacheWithSizeLimit, mergeFileStateCaches, READ_FILE_STATE_CACHE_SIZE } from '../utils/fileStateCache.js';
+// Global session state: interaction timestamps, CWD, project root, session IDs,
+// and per-turn performance metrics (hook/tool/classifier durations) used for
+// the API metrics message appended after each assistant turn
 import { updateLastInteractionTime, getLastInteractionTime, getOriginalCwd, getProjectRoot, getSessionId, switchSession, setCostStateForRestore, getTurnHookDurationMs, getTurnHookCount, resetTurnHookDuration, getTurnToolDurationMs, getTurnToolCount, resetTurnToolDuration, getTurnClassifierDurationMs, getTurnClassifierCount, resetTurnClassifierDuration } from '../bootstrap/state.js';
+// Branded ID types for type-safe session and agent identification
 import { asSessionId, asAgentId } from '../types/ids.js';
 import { logForDebugging } from '../utils/debug.js';
+// QueryGuard prevents overlapping API calls — ensures only one query is in-flight
 import { QueryGuard } from '../utils/QueryGuard.js';
 import { isEnvTruthy } from '../utils/envUtils.js';
 import { formatTokens, truncateToWidth } from '../utils/format.js';
+// Drains keystrokes buffered before React mounts (e.g., user typed during splash)
 import { consumeEarlyInput } from '../utils/earlyInput.js';
+// Swarm (multi-agent) helpers: mark a teammate as active/inactive in the swarm
 import { setMemberActive } from '../utils/swarm/teamHelpers.js';
+// Swarm permission sync: detect if this instance is a worker, and relay sandbox
+// permission requests/responses between leader and worker via the mailbox protocol
 import { isSwarmWorker, generateSandboxRequestId, sendSandboxPermissionRequestViaMailbox, sendSandboxPermissionResponseViaMailbox } from '../utils/swarm/permissionSync.js';
 import { registerSandboxPermissionCallback } from '../hooks/useSwarmPermissionPoller.js';
 import { getTeamName, getAgentName } from '../utils/teammate.js';
+// UI component shown to worker agents while waiting for leader permission approval
 import { WorkerPendingPermission } from '../components/permissions/WorkerPendingPermission.js';
+// In-process teammate task management — inject messages, query running tasks
 import { injectUserMessageToTeammate, getAllInProcessTeammateTasks } from '../tasks/InProcessTeammateTask/InProcessTeammateTask.js';
+// Local agent task management — queue messages, append to running local agents
 import { isLocalAgentTask, queuePendingMessage, appendMessageToLocalAgent, type LocalAgentTaskState } from '../tasks/LocalAgentTask/LocalAgentTask.js';
+// Leader permission bridge: forwards tool-use confirmation and permission-context
+// requests from swarm workers to the leader instance's UI for interactive approval
 import { registerLeaderToolUseConfirmQueue, unregisterLeaderToolUseConfirmQueue, registerLeaderSetToolPermissionContext, unregisterLeaderSetToolPermissionContext } from '../utils/swarm/leaderPermissionBridge.js';
+// Telemetry: close the OpenTelemetry interaction span when a turn completes
 import { endInteractionSpan } from '../utils/telemetry/sessionTracing.js';
+// Hook that captures structured log messages for display in the UI
 import { useLogMessages } from '../hooks/useLogMessages.js';
+// Bridge between the REPL component and external callers (e.g., IDE extensions)
+// that need to programmatically submit prompts or read state
 import { useReplBridge } from '../hooks/useReplBridge.js';
+// Command system types: Command definitions, result display modes, and the
+// resume entrypoint for /resume command flow
 import { type Command, type CommandResultDisplay, type ResumeEntrypoint, getCommandName, isCommandEnabled } from '../commands.js';
+// Types for the prompt input component: mode (normal/plan/vim), queued commands, vim state
 import type { PromptInputMode, QueuedCommand, VimMode } from '../types/textInputTypes.js';
+// MessageSelector: UI for the rewind dialog — lets users pick a past message to revert to
 import { MessageSelector, selectableUserMessagesFilter, messagesAfterAreOnlySynthetic } from '../components/MessageSelector.js';
+// IDE logging hook — forwards conversation events to connected IDE extensions
 import { useIdeLogging } from '../hooks/useIdeLogging.js';
+// Interactive permission request dialog — shown when a tool needs user approval
 import { PermissionRequest, type ToolUseConfirm } from '../components/permissions/PermissionRequest.js';
+// MCP (Model Context Protocol) elicitation dialog — prompts user for MCP server input
 import { ElicitationDialog } from '../components/mcp/ElicitationDialog.js';
+// Generic prompt dialog for hook system prompts
 import { PromptDialog } from '../components/hooks/PromptDialog.js';
 import type { PromptRequest, PromptResponse } from '../types/hooks.js';
+// The main text input component where users type their prompts
 import PromptInput from '../components/PromptInput/PromptInput.js';
+// Displays queued slash commands above the prompt input
 import { PromptInputQueuedCommands } from '../components/PromptInput/PromptInputQueuedCommands.js';
+// Hook for remote session mode (SSH tunneling to a remote machine)
 import { useRemoteSession } from '../hooks/useRemoteSession.js';
+// Hook for direct-connect mode (connecting directly to an API endpoint)
 import { useDirectConnect } from '../hooks/useDirectConnect.js';
 import type { DirectConnectConfig } from '../server/directConnectManager.js';
+// Hook for SSH session management
 import { useSSHSession } from '../hooks/useSSHSession.js';
+// Hook for navigating through assistant message history (up/down arrows)
 import { useAssistantHistory } from '../hooks/useAssistantHistory.js';
 import type { SSHSession } from '../ssh/createSSHSession.js';
+// Post-session skill improvement survey component
 import { SkillImprovementSurvey } from '../components/SkillImprovementSurvey.js';
 import { useSkillImprovementSurvey } from '../hooks/useSkillImprovementSurvey.js';
+// MoreRight integration — premium features UI
 import { useMoreRight } from '../moreright/useMoreRight.js';
+// Spinner variants: verb-based spinner ("Thinking...", "Running...") and brief idle status
 import { SpinnerWithVerb, BriefIdleStatus, type SpinnerMode } from '../components/Spinner.js';
+// System prompt construction: base prompt, effective prompt with context, and user context
 import { getSystemPrompt } from '../constants/prompts.js';
 import { buildEffectiveSystemPrompt } from '../utils/systemPrompt.js';
 import { getSystemContext, getUserContext } from '../context.js';
+// Memory files: reads .claude/CLAUDE.md and other memory/instruction files
 import { getMemoryFiles } from '../utils/claudemd.js';
+// Background housekeeping: periodic tasks like cache cleanup, session file rotation
 import { startBackgroundHousekeeping } from '../utils/backgroundHousekeeping.js';
+// Cost tracking: read/save/reset accumulated API costs for the current session
 import { getTotalCost, saveCurrentSessionCosts, resetCostState, getStoredSessionCosts } from '../cost-tracker.js';
+// React hook wrapper around cost tracking state for reactive UI updates
 import { useCostSummary } from '../costHook.js';
+// FPS metrics context — tracks rendering performance for diagnostics
 import { useFpsMetrics } from '../context/fpsMetrics.js';
+// Defers work until after the first React render (avoids blocking initial paint)
 import { useAfterFirstRender } from '../hooks/useAfterFirstRender.js';
+// Defers hook result messages to avoid flooding the UI during rapid hook execution
 import { useDeferredHookMessages } from '../hooks/useDeferredHookMessages.js';
+// Command history: add/remove entries, expand pasted text references, parse @-references
 import { addToHistory, removeLastFromHistory, expandPastedTextRefs, parseReferences } from '../history.js';
+// Prepends mode prefix characters (e.g., "!" for bash mode) to the input string
 import { prependModeCharacterToInput } from '../components/PromptInput/inputModes.js';
+// Caches shell history for tab-completion suggestions
 import { prependToShellHistoryCache } from '../utils/suggestions/shellHistoryCompletion.js';
+// Verifies the API key is valid on startup
 import { useApiKeyVerification } from '../hooks/useApiKeyVerification.js';
+// ─── Keybinding System ───────────────────────────────────────────────────────
+// GlobalKeybindingHandlers: handles app-wide keybindings (ctrl+l redraw, ctrl+t todos, etc.)
 import { GlobalKeybindingHandlers } from '../hooks/useGlobalKeybindings.js';
+// CommandKeybindingHandlers: handles keybindings that trigger slash commands
 import { CommandKeybindingHandlers } from '../hooks/useCommandKeybindings.js';
+// KeybindingSetup: initializes the keybinding context stack and provider
 import { KeybindingSetup } from '../keybindings/KeybindingProviderSetup.js';
+// Resolves a keybinding action to its display string (e.g., "ctrl+c" → "^C")
 import { useShortcutDisplay } from '../keybindings/useShortcutDisplay.js';
 import { getShortcutDisplay } from '../keybindings/shortcutFormat.js';
+// CancelRequestHandler: handles ctrl+c to cancel in-flight API requests
 import { CancelRequestHandler } from '../hooks/useCancelRequest.js';
+// Hook for navigating between background tasks (agents running in parallel)
 import { useBackgroundTaskNavigation } from '../hooks/useBackgroundTaskNavigation.js';
+// Initializes the swarm subsystem (multi-agent coordination)
 import { useSwarmInitialization } from '../hooks/useSwarmInitialization.js';
+// Auto-exits teammate view when the teammate task completes
 import { useTeammateViewAutoExit } from '../hooks/useTeammateViewAutoExit.js';
 import { errorMessage } from '../utils/errors.js';
+// Predicate to check if a message represents a human (user) turn in the conversation
 import { isHumanTurn } from '../utils/messagePredicates.js';
 import { logError } from '../utils/log.js';
-// Dead code elimination: conditional imports
+// ─── Dead Code Elimination: Conditional Imports ──────────────────────────────
+// These use `feature()` compile-time flags + dynamic `require()` so that
+// entire modules are tree-shaken from the production bundle when the feature
+// is disabled. The no-op stubs ensure the call-sites compile without branches.
 /* eslint-disable custom-rules/no-process-env-top-level, @typescript-eslint/no-require-imports */
+// Voice mode integration: provides push-to-talk, speech-to-text transcription,
+// and voice keybinding handlers. When VOICE_MODE is off, stubs return no-ops.
 const useVoiceIntegration: typeof import('../hooks/useVoiceIntegration.js').useVoiceIntegration = feature('VOICE_MODE') ? require('../hooks/useVoiceIntegration.js').useVoiceIntegration : () => ({
   stripTrailing: () => 0,
   handleKeyEvent: () => {},
   resetAnchor: () => {}
 });
+// VoiceKeybindingHandler: React component that registers voice-specific keybindings
+// (e.g., spacebar for push-to-talk). Returns null when VOICE_MODE is disabled.
 const VoiceKeybindingHandler: typeof import('../hooks/useVoiceIntegration.js').VoiceKeybindingHandler = feature('VOICE_MODE') ? require('../hooks/useVoiceIntegration.js').VoiceKeybindingHandler : () => null;
 // Frustration detection is ant-only (dogfooding). Conditional require so external
 // builds eliminate the module entirely (including its two O(n) useMemos that run
 // on every messages change, plus the GrowthBook fetch).
+// Detects user frustration patterns (repeated cancels, etc.) and shows a feedback survey.
 const useFrustrationDetection: typeof import('../components/FeedbackSurvey/useFrustrationDetection.js').useFrustrationDetection = "external" === 'ant' ? require('../components/FeedbackSurvey/useFrustrationDetection.js').useFrustrationDetection : () => ({
   state: 'closed',
   handleTranscriptSelect: () => {}
@@ -112,151 +220,272 @@ const useFrustrationDetection: typeof import('../components/FeedbackSurvey/useFr
 // eliminated from external builds (one UUID is on excluded-strings).
 const useAntOrgWarningNotification: typeof import('../hooks/notifs/useAntOrgWarningNotification.js').useAntOrgWarningNotification = "external" === 'ant' ? require('../hooks/notifs/useAntOrgWarningNotification.js').useAntOrgWarningNotification : () => {};
 // Dead code elimination: conditional import for coordinator mode
+// Coordinator mode provides additional user context when running as a
+// multi-agent coordinator (e.g., MCP client names, scratchpad directory).
 const getCoordinatorUserContext: (mcpClients: ReadonlyArray<{
   name: string;
 }>, scratchpadDir?: string) => {
   [k: string]: string;
 } = feature('COORDINATOR_MODE') ? require('../coordinator/coordinatorMode.js').getCoordinatorUserContext : () => ({});
 /* eslint-enable custom-rules/no-process-env-top-level, @typescript-eslint/no-require-imports */
+// ─── Tool Permission System ──────────────────────────────────────────────────
+// useCanUseTool: hook that checks whether a tool invocation is allowed given
+// the current permission context (auto-approve, ask, deny)
 import useCanUseTool from '../hooks/useCanUseTool.js';
 import type { ToolPermissionContext, Tool } from '../Tool.js';
+// Permission update utilities: apply permission changes to the in-memory state
+// and persist them to the config file
 import { applyPermissionUpdate, applyPermissionUpdates, persistPermissionUpdate } from '../utils/permissions/PermissionUpdate.js';
+// Builds permission updates when exiting plan mode (converts planned permissions to active)
 import { buildPermissionUpdates } from '../components/permissions/ExitPlanModePermissionRequest/ExitPlanModePermissionRequest.js';
+// Strips dangerous permissions (e.g., unrestricted bash) in auto-approve mode
 import { stripDangerousPermissionsForAutoMode } from '../utils/permissions/permissionSetup.js';
+// Scratchpad directory for agent intermediate files (sandboxed filesystem area)
 import { getScratchpadDir, isScratchpadEnabled } from '../utils/permissions/filesystem.js';
+// Tool name constants used for special-case handling
 import { WEB_FETCH_TOOL_NAME } from '../tools/WebFetchTool/prompt.js';
 import { SLEEP_TOOL_NAME } from '../tools/SleepTool/prompt.js';
+// Clears speculative permission checks when a tool invocation is confirmed
 import { clearSpeculativeChecks } from '../tools/BashTool/bashPermissions.js';
 import type { AutoUpdaterResult } from '../utils/autoUpdater.js';
+// Global config: read/write user-level settings (~/.claude/config.json)
 import { getGlobalConfig, saveGlobalConfig, getGlobalConfigWriteCount } from '../utils/config.js';
+// Checks if the user has console billing access (for cost threshold features)
 import { hasConsoleBillingAccess } from '../utils/billing.js';
+// Analytics event logging (with type-safe metadata verification)
 import { logEvent, type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS } from 'src/services/analytics/index.js';
+// Cached feature flag values from GrowthBook (may be stale — suitable for non-critical UI)
 import { getFeatureValue_CACHED_MAY_BE_STALE } from 'src/services/analytics/growthbook.js';
+// ─── Message Construction & Processing ───────────────────────────────────────
+// Core message utilities: create/format messages, handle streaming tool use and
+// thinking blocks, detect compact boundaries, extract text content
 import { textForResubmit, handleMessageFromStream, type StreamingToolUse, type StreamingThinking, isCompactBoundaryMessage, getMessagesAfterCompactBoundary, getContentText, createUserMessage, createAssistantMessage, createTurnDurationMessage, createAgentsKilledMessage, createApiMetricsMessage, createSystemMessage, createCommandInputMessage, formatCommandInputTags } from '../utils/messages.js';
+// Generates a human-readable session title from the first few messages
 import { generateSessionTitle } from '../utils/sessionTitle.js';
+// XML tag constants for structured command/tool output
 import { BASH_INPUT_TAG, COMMAND_MESSAGE_TAG, COMMAND_NAME_TAG, LOCAL_COMMAND_STDOUT_TAG } from '../constants/xml.js';
 import { escapeXml } from '../utils/xml.js';
 import type { ThinkingConfig } from '../utils/thinking.js';
+// Graceful shutdown: flushes pending writes and cleans up on exit
 import { gracefulShutdownSync } from '../utils/gracefulShutdown.js';
+// Handles the complex logic of processing a submitted prompt (validation,
+// command parsing, message creation, API dispatch)
 import { handlePromptSubmit, type PromptInputHelpers } from '../utils/handlePromptSubmit.js';
+// Queue processor hook: processes queued user messages/commands sequentially
 import { useQueueProcessor } from '../hooks/useQueueProcessor.js';
+// Mailbox bridge: connects the REPL to the inter-process mailbox for swarm communication
 import { useMailboxBridge } from '../hooks/useMailboxBridge.js';
+// Query profiler: tracks API call performance for diagnostics
 import { queryCheckpoint, logQueryProfileReport } from '../utils/queryProfiler.js';
+// Message types: the core message union type and specialized message variants
 import type { Message as MessageType, UserMessage, ProgressMessage, HookResultMessage, PartialCompactDirection } from '../types/message.js';
+// The main API query function — sends messages to the Claude API and streams responses
 import { query } from '../query.js';
+// ─── Plugin & MCP Integration ────────────────────────────────────────────────
+// Merges tools/clients/commands from built-in sources and MCP plugin servers
 import { mergeClients, useMergedClients } from '../hooks/useMergedClients.js';
 import { getQuerySourceForREPL } from '../utils/promptCategory.js';
 import { useMergedTools } from '../hooks/useMergedTools.js';
 import { mergeAndFilterTools } from '../utils/toolPool.js';
 import { useMergedCommands } from '../hooks/useMergedCommands.js';
+// Detects changes to active skills (slash command plugins) and reloads them
 import { useSkillsChange } from '../hooks/useSkillsChange.js';
+// Plugin management: install, uninstall, enable, disable MCP plugins
 import { useManagePlugins } from '../hooks/useManagePlugins.js';
+// ─── UI Components ───────────────────────────────────────────────────────────
+// Messages: renders the conversation message list (user prompts, assistant responses, tool results)
 import { Messages } from '../components/Messages.js';
+// TaskListV2: displays the collapsible task/todo list sidebar
 import { TaskListV2 } from '../components/TaskListV2.js';
+// Header bar shown when viewing a teammate's conversation in swarm mode
 import { TeammateViewHeader } from '../components/TeammateViewHeader.js';
+// Hook that manages TaskListV2 state with auto-collapse behavior
 import { useTasksV2WithCollapseEffect } from '../hooks/useTasksV2.js';
+// Marks the project onboarding flow as complete after first successful interaction
 import { maybeMarkProjectOnboardingComplete } from '../projectOnboardingState.js';
 import type { MCPServerConnection } from '../services/mcp/types.js';
 import type { ScopedMcpServerConfig } from '../services/mcp/types.js';
 import { randomUUID, type UUID } from 'crypto';
+// Runs session-start hooks (user-defined scripts that execute when a new session begins)
 import { processSessionStartHooks } from '../utils/sessionStart.js';
+// Runs session-end hooks (cleanup scripts) with a configurable timeout
 import { executeSessionEndHooks, getSessionEndHookTimeoutMs } from '../utils/hooks.js';
+// IDE selection integration: captures the user's current editor selection for context
 import { type IDESelection, useIdeSelection } from '../hooks/useIdeSelection.js';
+// Tool assembly: collects all available tools (built-in + MCP + agents) into a pool
 import { getTools, assembleToolPool } from '../tools.js';
 import type { AgentDefinition } from '../tools/AgentTool/loadAgentsDir.js';
+// Resolves agent tool definitions into executable tool instances
 import { resolveAgentTools } from '../tools/AgentTool/agentToolUtils.js';
+// Resumes a background agent task (after user returns from idle or tab switch)
 import { resumeAgentBackground } from '../tools/AgentTool/resumeAgent.js';
+// Hook that manages the main loop model selection (claude-sonnet, claude-opus, etc.)
 import { useMainLoopModel } from '../hooks/useMainLoopModel.js';
+// ─── App State Management ────────────────────────────────────────────────────
+// Zustand-like store for global application state — provides reactive access
+// to messages, tools, MCP connections, permissions, and UI flags
 import { useAppState, useSetAppState, useAppStateStore } from '../state/AppState.js';
 import type { ContentBlockParam, ImageBlockParam } from '@anthropic-ai/sdk/resources/messages.mjs';
 import type { ProcessUserInputContext } from '../utils/processUserInput/processUserInput.js';
 import type { PastedContent } from '../utils/config.js';
+// Plan mode utilities: copy/resume/get/set plan slugs for the plan-execute workflow
 import { copyPlanForFork, copyPlanForResume, getPlanSlug, setPlanSlug } from '../utils/plans.js';
+// ─── Session Storage & Recovery ──────────────────────────────────────────────
+// Session persistence: save/restore conversation state to disk for resume functionality,
+// manage session metadata, determine which messages are loggable vs. ephemeral
 import { clearSessionMetadata, resetSessionFilePointer, adoptResumedSessionFile, removeTranscriptMessage, restoreSessionMetadata, getCurrentSessionTitle, isEphemeralToolProgress, isLoggableMessage, saveWorktreeState, getAgentTranscript } from '../utils/sessionStorage.js';
+// Deserializes messages from a saved session file for conversation recovery
 import { deserializeMessages } from '../utils/conversationRecovery.js';
+// Extracts file-read and bash-tool operations from message history for context building
 import { extractReadFilesFromMessages, extractBashToolsFromMessages } from '../utils/queryHelpers.js';
+// Micro-compact: aggressive context compression for very long conversations
 import { resetMicrocompactState } from '../services/compact/microCompact.js';
+// Post-compact cleanup: removes stale tool results after conversation compaction
 import { runPostCompactCleanup } from '../services/compact/postCompactCleanup.js';
+// Content replacement: provisions/reconstructs state for replacing large tool results
+// with summaries (saves tokens while preserving conversation coherence)
 import { provisionContentReplacementState, reconstructContentReplacementState, type ContentReplacementRecord } from '../utils/toolResultStorage.js';
+// Partial conversation compaction: compresses older messages while keeping recent ones
 import { partialCompactConversation } from '../services/compact/compact.js';
 import type { LogOption } from '../types/logs.js';
 import type { AgentColorName } from '../tools/AgentTool/agentColorManager.js';
+// ─── File History (Undo/Rewind) ──────────────────────────────────────────────
+// Snapshot-based file history for the /undo and rewind features — tracks file
+// states at turn boundaries so the user can revert to any previous turn's files
 import { fileHistoryMakeSnapshot, type FileHistoryState, fileHistoryRewind, type FileHistorySnapshot, copyFileHistoryForResume, fileHistoryEnabled, fileHistoryHasAnyChanges } from '../utils/fileHistory.js';
+// Commit attribution: tracks which turns modified which files for git attribution
 import { type AttributionState, incrementPromptCount } from '../utils/commitAttribution.js';
 import { recordAttributionSnapshot } from '../utils/sessionStorage.js';
+// Session restore: rebuilds agent state, worktree, and session log from a saved session
 import { computeStandaloneAgentContext, restoreAgentFromSession, restoreSessionStateFromLog, restoreWorktreeForResume, exitRestoredWorktree } from '../utils/sessionRestore.js';
+// Concurrent session management: detect background sessions, update session metadata
 import { isBgSession, updateSessionName, updateSessionActivity } from '../utils/concurrentSessions.js';
 import { isInProcessTeammateTask, type InProcessTeammateTaskState } from '../tasks/InProcessTeammateTask/types.js';
+// Restores remote agent tasks from a previous session
 import { restoreRemoteAgentTasks } from '../tasks/RemoteAgentTask/RemoteAgentTask.js';
+// Inbox poller: watches for incoming messages from teammates in swarm mode
 import { useInboxPoller } from '../hooks/useInboxPoller.js';
-// Dead code elimination: conditional import for loop mode
+// ─── Dead Code Elimination: Loop/Proactive Mode ─────────────────────────────
+// Proactive mode: enables the assistant to proactively suggest actions (ant-only).
+// Kairos: scheduled/triggered agent execution. Both are conditionally loaded.
 /* eslint-disable @typescript-eslint/no-require-imports */
 const proactiveModule = feature('PROACTIVE') || feature('KAIROS') ? require('../proactive/index.js') : null;
+// No-op stubs for proactive features when disabled — prevents runtime errors
 const PROACTIVE_NO_OP_SUBSCRIBE = (_cb: () => void) => () => {};
 const PROACTIVE_FALSE = () => false;
 const SUGGEST_BG_PR_NOOP = (_p: string, _n: string): boolean => false;
+// Proactive mode hook: manages proactive suggestion state and triggers
 const useProactive = feature('PROACTIVE') || feature('KAIROS') ? require('../proactive/useProactive.js').useProactive : null;
+// Scheduled tasks: cron-like agent triggers (AGENT_TRIGGERS feature flag)
 const useScheduledTasks = feature('AGENT_TRIGGERS') ? require('../hooks/useScheduledTasks.js').useScheduledTasks : null;
 /* eslint-enable @typescript-eslint/no-require-imports */
+// Checks if agent swarms (multi-agent collaboration) are enabled for this session
 import { isAgentSwarmsEnabled } from '../utils/agentSwarmsEnabled.js';
+// Watches for changes to the todo/task list file and syncs with UI
 import { useTaskListWatcher } from '../hooks/useTaskListWatcher.js';
 import type { SandboxAskCallback, NetworkHostPattern } from '../utils/sandbox/sandbox-adapter.js';
+// IDE integration: detect connected IDE, close open diffs, get IDE type
 import { type IDEExtensionInstallationStatus, closeOpenDiffs, getConnectedIdeClient, type IdeType } from '../utils/ide.js';
+// Hook that manages the IDE extension connection lifecycle
 import { useIDEIntegration } from '../hooks/useIDEIntegration.js';
+// The /exit command handler — initiates graceful shutdown
 import exit from '../commands/exit/index.js';
+// ExitFlow component: manages the multi-step exit process (save, cleanup, etc.)
 import { ExitFlow } from '../components/ExitFlow.js';
+// Gets the current worktree session (for git worktree-based branching)
 import { getCurrentWorktreeSession } from '../utils/worktree.js';
+// Message queue manager: manages the queue of pending user messages and commands
+// that are processed sequentially by the REPL loop
 import { popAllEditable, enqueue, type SetAppState, getCommandQueue, getCommandQueueLength, removeByFilter } from '../utils/messageQueueManager.js';
+// Hook wrapper around the message queue for React lifecycle integration
 import { useCommandQueue } from '../hooks/useCommandQueue.js';
+// Visual hint shown when a session is running in the background
 import { SessionBackgroundHint } from '../components/SessionBackgroundHint.js';
+// Starts a session in background mode (detached from the terminal)
 import { startBackgroundSession } from '../tasks/LocalMainSessionTask.js';
+// Hook that manages session backgrounding (ctrl+z style)
 import { useSessionBackgrounding } from '../hooks/useSessionBackgrounding.js';
+// Diagnostic tracker: collects runtime diagnostics for the /doctor command
 import { diagnosticTracker } from '../services/diagnosticTracking.js';
+// Speculation: handles speculative prompt completions (type-ahead predictions)
 import { handleSpeculationAccept, type ActiveSpeculationState } from '../services/PromptSuggestion/speculation.js';
+// IDE onboarding dialog shown on first launch when an IDE extension is detected
 import { IdeOnboardingDialog } from '../components/IdeOnboardingDialog.js';
+// Effort callout: shows a notification about the current thinking effort level
 import { EffortCallout, shouldShowEffortCallout } from '../components/EffortCallout.js';
 import type { EffortValue } from '../utils/effort.js';
+// Remote mode callout: shows connection status when using remote sessions
 import { RemoteCallout } from '../components/RemoteCallout.js';
 /* eslint-disable custom-rules/no-process-env-top-level, @typescript-eslint/no-require-imports */
+// Ant-only UI callouts — conditionally loaded so they're eliminated from external builds
 const AntModelSwitchCallout = "external" === 'ant' ? require('../components/AntModelSwitchCallout.js').AntModelSwitchCallout : null;
 const shouldShowAntModelSwitch = "external" === 'ant' ? require('../components/AntModelSwitchCallout.js').shouldShowModelSwitchCallout : (): boolean => false;
 const UndercoverAutoCallout = "external" === 'ant' ? require('../components/UndercoverAutoCallout.js').UndercoverAutoCallout : null;
 /* eslint-enable custom-rules/no-process-env-top-level, @typescript-eslint/no-require-imports */
+// Activity manager: tracks user activity for idle detection and session timeouts
 import { activityManager } from '../utils/activityManager.js';
+// Creates abort controllers for cancelling in-flight API requests
 import { createAbortController } from '../utils/abortController.js';
+// MCP connection manager: manages lifecycle of Model Context Protocol server connections
 import { MCPConnectionManager } from 'src/services/mcp/MCPConnectionManager.js';
+// ─── Feedback & Survey Hooks ─────────────────────────────────────────────────
+// Various survey hooks for collecting user feedback at strategic moments
 import { useFeedbackSurvey } from 'src/components/FeedbackSurvey/useFeedbackSurvey.js';
 import { useMemorySurvey } from 'src/components/FeedbackSurvey/useMemorySurvey.js';
 import { usePostCompactSurvey } from 'src/components/FeedbackSurvey/usePostCompactSurvey.js';
 import { FeedbackSurvey } from 'src/components/FeedbackSurvey/FeedbackSurvey.js';
+// ─── Notification Hooks ──────────────────────────────────────────────────────
+// Each hook manages a specific notification type — install prompts, away summaries,
+// Chrome extension hints, marketplace recommendations, etc.
 import { useInstallMessages } from 'src/hooks/notifs/useInstallMessages.js';
 import { useAwaySummary } from 'src/hooks/useAwaySummary.js';
 import { useChromeExtensionNotification } from 'src/hooks/useChromeExtensionNotification.js';
 import { useOfficialMarketplaceNotification } from 'src/hooks/useOfficialMarketplaceNotification.js';
+// Processes prompts sent from the Claude-in-Chrome browser extension
 import { usePromptsFromClaudeInChrome } from 'src/hooks/usePromptsFromClaudeInChrome.js';
+// Tip scheduler: picks a contextual tip to show during spinner animations
 import { getTipToShowOnSpinner, recordShownTip } from 'src/services/tips/tipScheduler.js';
 import type { Theme } from 'src/utils/theme.js';
+// Permission bypass killswitch: checks if dangerously-broad permissions should be auto-disabled
 import { checkAndDisableBypassPermissionsIfNeeded, checkAndDisableAutoModeIfNeeded, useKickOffCheckAndDisableBypassPermissionsIfNeeded, useKickOffCheckAndDisableAutoModeIfNeeded } from 'src/utils/permissions/bypassPermissionsKillswitch.js';
+// Sandbox adapter: manages the sandboxed execution environment for tool commands
 import { SandboxManager } from 'src/utils/sandbox/sandbox-adapter.js';
 import { SANDBOX_NETWORK_ACCESS_TOOL_NAME } from 'src/cli/structuredIO.js';
+// Initializes file history snapshots on session start for undo support
 import { useFileHistorySnapshotInit } from 'src/hooks/useFileHistorySnapshotInit.js';
+// Sandbox permission request dialog — shown when a sandboxed tool needs elevated access
 import { SandboxPermissionRequest } from 'src/components/permissions/SandboxPermissionRequest.js';
+// Expanded view for sandbox violation details (shows what was blocked and why)
 import { SandboxViolationExpandedView } from 'src/components/SandboxViolationExpandedView.js';
+// Settings validation errors notification hook
 import { useSettingsErrors } from 'src/hooks/notifs/useSettingsErrors.js';
+// MCP server connectivity status monitoring
 import { useMcpConnectivityStatus } from 'src/hooks/notifs/useMcpConnectivityStatus.js';
+// Notification when auto-mode is unavailable (e.g., billing issue)
 import { useAutoModeUnavailableNotification } from 'src/hooks/notifs/useAutoModeUnavailableNotification.js';
 import { AUTO_MODE_DESCRIPTION } from 'src/components/AutoModeOptInDialog.js';
+// LSP (Language Server Protocol) initialization status notification
 import { useLspInitializationNotification } from 'src/hooks/notifs/useLspInitializationNotification.js';
+// Recommends LSP plugins based on the project's language
 import { useLspPluginRecommendation } from 'src/hooks/useLspPluginRecommendation.js';
 import { LspRecommendationMenu } from 'src/components/LspRecommendation/LspRecommendationMenu.js';
+// Claude Code Hint plugin recommendation system
 import { useClaudeCodeHintRecommendation } from 'src/hooks/useClaudeCodeHintRecommendation.js';
 import { PluginHintMenu } from 'src/components/ClaudeCodeHint/PluginHintMenu.js';
+// Desktop app upsell dialog shown on startup to terminal users
 import { DesktopUpsellStartup, shouldShowDesktopUpsellStartup } from 'src/components/DesktopUpsell/DesktopUpsellStartup.js';
+// Plugin installation and auto-update notification hooks
 import { usePluginInstallationStatus } from 'src/hooks/notifs/usePluginInstallationStatus.js';
 import { usePluginAutoupdateNotification } from 'src/hooks/notifs/usePluginAutoupdateNotification.js';
+// Runs startup checks for installed plugins (version compat, health, etc.)
 import { performStartupChecks } from 'src/utils/plugins/performStartupChecks.js';
+// Renders a user's text message in the conversation view
 import { UserTextMessage } from 'src/components/messages/UserTextMessage.js';
+// AWS authentication status indicator
 import { AwsAuthStatusBox } from '../components/AwsAuthStatusBox.js';
+// ─── More Notification Hooks ─────────────────────────────────────────────────
+// Rate limit, deprecation, npm deprecation, IDE status, model migration,
+// subscription switching, teammate lifecycle, and fast mode notifications
 import { useRateLimitWarningNotification } from 'src/hooks/notifs/useRateLimitWarningNotification.js';
 import { useDeprecationWarningNotification } from 'src/hooks/notifs/useDeprecationWarningNotification.js';
 import { useNpmDeprecationNotification } from 'src/hooks/notifs/useNpmDeprecationNotification.js';
@@ -265,29 +494,46 @@ import { useModelMigrationNotifications } from 'src/hooks/notifs/useModelMigrati
 import { useCanSwitchToExistingSubscription } from 'src/hooks/notifs/useCanSwitchToExistingSubscription.js';
 import { useTeammateLifecycleNotification } from 'src/hooks/notifs/useTeammateShutdownNotification.js';
 import { useFastModeNotification } from 'src/hooks/notifs/useFastModeNotification.js';
+// Auto-run issue detection: determines if a GitHub issue should be auto-run on startup
 import { AutoRunIssueNotification, shouldAutoRunIssue, getAutoRunIssueReasonText, getAutoRunCommand, type AutoRunIssueReason } from '../utils/autoRunIssue.js';
 import type { HookProgress } from '../types/hooks.js';
+// Tungsten tool live monitor: displays real-time status of Tungsten tool execution
 import { TungstenLiveMonitor } from '../tools/TungstenTool/TungstenLiveMonitor.js';
 /* eslint-disable @typescript-eslint/no-require-imports */
+// Web browser tool panel: conditionally loaded for the WEB_BROWSER_TOOL feature
 const WebBrowserPanelModule = feature('WEB_BROWSER_TOOL') ? require('../tools/WebBrowserTool/WebBrowserPanel.js') as typeof import('../tools/WebBrowserTool/WebBrowserPanel.js') : null;
 /* eslint-enable @typescript-eslint/no-require-imports */
+// Issue flag banner: shows a banner when the session was started from a GitHub issue
 import { IssueFlagBanner } from '../components/PromptInput/IssueFlagBanner.js';
 import { useIssueFlagBanner } from '../hooks/useIssueFlagBanner.js';
+// Companion sprite: the animated mascot character shown in wide terminals
 import { CompanionSprite, CompanionFloatingBubble, MIN_COLS_FOR_FULL_SPRITE } from '../buddy/CompanionSprite.js';
+// Developer toolbar: debug information overlay for development builds
 import { DevBar } from '../components/DevBar.js';
 // Session manager removed - using AppState now
 import type { RemoteSessionConfig } from '../remote/RemoteSessionManager.js';
+// Commands that are safe to execute in remote mode (restricted set)
 import { REMOTE_SAFE_COMMANDS } from '../commands.js';
 import type { RemoteMessageContent } from '../utils/teleport/api.js';
+// ─── Fullscreen / Alternate Screen Rendering ─────────────────────────────────
+// FullscreenLayout: wraps the entire REPL in an alternate-screen terminal layout
+// with virtual scrolling, unseen message dividers, and mouse tracking support
 import { FullscreenLayout, useUnseenDivider, computeUnseenDivider } from '../components/FullscreenLayout.js';
+// Fullscreen utilities: check env flags, detect tmux mouse hints, mouse tracking state
 import { isFullscreenEnvEnabled, maybeGetTmuxMouseHint, isMouseTrackingEnabled } from '../utils/fullscreen.js';
+// AlternateScreen: switches the terminal to alt-screen mode (saves/restores main buffer)
 import { AlternateScreen } from '../ink/components/AlternateScreen.js';
+// ScrollKeybindingHandler: manages keyboard-driven scrolling in fullscreen mode
 import { ScrollKeybindingHandler } from '../components/ScrollKeybindingHandler.js';
+// Message actions: edit, copy, pin actions on individual messages in the conversation
 import { useMessageActions, MessageActionsKeybindings, MessageActionsBar, type MessageActionsState, type MessageActionsNav, type MessageActionCaps } from '../components/messageActions.js';
+// Clipboard integration via OSC 52 escape sequences
 import { setClipboard } from '../ink/termio/osc.js';
 import type { ScrollBoxHandle } from '../ink/components/ScrollBox.js';
+// Attachment utilities: creates attachment messages from files, extracts queued attachments
 import { createAttachmentMessage, getQueuedCommandAttachments } from '../utils/attachments.js';
 
+// ─── Module-Level Constants ──────────────────────────────────────────────────
 // Stable empty array for hooks that accept MCPServerConnection[] — avoids
 // creating a new [] literal on every render in remote mode, which would
 // cause useEffect dependency changes and infinite re-render loops.
@@ -308,6 +554,7 @@ const RECENT_SCROLL_REPIN_WINDOW_MS = 3000;
 // 100 files should be sufficient for most coding sessions while preventing
 // memory issues when working across many files in large projects
 
+// Computes the median of a numeric array — used for performance metric reporting
 function median(values: number[]): number {
   const sorted = [...values].sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);

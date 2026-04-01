@@ -1,14 +1,51 @@
+// =============================================================================
+// App.tsx — Root Application Component
+// =============================================================================
+// This is the top-level React component for interactive Claude Code sessions.
+// It establishes the React context provider hierarchy that all child components
+// depend on. The nesting order matters — inner providers can access outer ones.
+//
+// Provider Hierarchy (outermost → innermost):
+//   1. FpsMetricsProvider — exposes rendering FPS metrics for performance monitoring
+//   2. StatsProvider — provides a stats store for tracking operational statistics
+//   3. AppStateProvider — the main application state store (messages, tools,
+//      permissions, MCP connections, etc.) with change notification callbacks
+//
+// The component uses the React Compiler's memoization cache (_c) to avoid
+// unnecessary re-renders. Each provider layer is independently memoized:
+// only the innermost changed provider and its children re-render.
+//
+// Note: This is the user-facing App component. There is a separate internal
+// Ink App component at src/ink/components/App.js that wraps the React tree
+// with Ink-specific providers (stdin, theme, focus).
+// =============================================================================
 import { c as _c } from "react/compiler-runtime";
 import React from 'react';
+// FpsMetricsProvider: makes FPS tracking data available to child components
+// (used by the DevBar and /doctor diagnostics)
 import { FpsMetricsProvider } from '../context/fpsMetrics.js';
+// StatsProvider: provides a lightweight stats store for operational metrics
+// (e.g., messages sent, tools executed, commands run)
 import { StatsProvider, type StatsStore } from '../context/stats.js';
+// AppStateProvider: the central state management provider — manages all
+// application state including messages, tool permissions, MCP connections,
+// agent definitions, plugins, and UI flags. Uses a Zustand-like store pattern.
+// onChangeAppState: callback fired on every state change for side effects
+// (e.g., persisting state, triggering re-renders in non-React consumers)
 import { type AppState, AppStateProvider } from '../state/AppState.js';
 import { onChangeAppState } from '../state/onChangeAppState.js';
 import type { FpsMetrics } from '../utils/fpsTracker.js';
+
+// Props for the root App component
 type Props = {
+  // Function that returns the current FPS metrics snapshot (or undefined if not yet available)
   getFpsMetrics: () => FpsMetrics | undefined;
+  // Optional stats store instance — if omitted, a default is created
   stats?: StatsStore;
+  // The initial application state — typically constructed during bootstrap
   initialState: AppState;
+  // The child React tree to render inside the provider hierarchy
+  // (usually the REPL screen component or a command-specific screen)
   children: React.ReactNode;
 };
 
@@ -17,13 +54,17 @@ type Props = {
  * Provides FPS metrics, stats context, and app state to the component tree.
  */
 export function App(t0) {
+  // React Compiler memo cache — 9 slots for memoizing provider subtrees
   const $ = _c(9);
+  // Destructure props from the compiler-transformed parameter
   const {
     getFpsMetrics,
     stats,
     initialState,
     children
   } = t0;
+  // Memoized innermost layer: AppStateProvider wraps children
+  // Only re-creates when children or initialState changes
   let t1;
   if ($[0] !== children || $[1] !== initialState) {
     t1 = <AppStateProvider initialState={initialState} onChangeAppState={onChangeAppState}>{children}</AppStateProvider>;
@@ -33,6 +74,8 @@ export function App(t0) {
   } else {
     t1 = $[2];
   }
+  // Memoized middle layer: StatsProvider wraps the AppStateProvider subtree
+  // Only re-creates when stats store or inner subtree changes
   let t2;
   if ($[3] !== stats || $[4] !== t1) {
     t2 = <StatsProvider store={stats}>{t1}</StatsProvider>;
@@ -42,6 +85,8 @@ export function App(t0) {
   } else {
     t2 = $[5];
   }
+  // Memoized outermost layer: FpsMetricsProvider wraps everything
+  // Only re-creates when getFpsMetrics function or inner subtree changes
   let t3;
   if ($[6] !== getFpsMetrics || $[7] !== t2) {
     t3 = <FpsMetricsProvider getFpsMetrics={getFpsMetrics}>{t2}</FpsMetricsProvider>;

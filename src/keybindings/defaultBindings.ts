@@ -1,6 +1,67 @@
+// =============================================================================
+// defaultBindings.ts — Default Keybinding Configuration
+// =============================================================================
+// Defines the complete set of default keybindings for Claude Code. These bindings
+// are loaded first, then user overrides from keybindings.json are merged on top.
+//
+// ─── Keybinding Context Hierarchy ────────────────────────────────────────────
+// Keybindings are organized into "contexts" — each context represents a UI mode
+// or screen. When multiple contexts are active, bindings are resolved from the
+// most specific (innermost) context first. The contexts are:
+//
+//   Global          — Always active. App-wide actions (ctrl+c, ctrl+l, ctrl+t, ctrl+o)
+//   Chat            — Active when the prompt input is focused. Submit, mode cycle, undo
+//   Autocomplete    — Active when the autocomplete dropdown is visible
+//   Settings        — Active when the settings/config panel is open
+//   Confirmation    — Active when a yes/no dialog is shown (permissions, etc.)
+//   Tabs            — Active when tab navigation is available
+//   Transcript      — Active when the transcript modal is open
+//   HistorySearch   — Active when ctrl+r history search is open
+//   Task            — Active when a foreground task (bash, agent) is running
+//   ThemePicker     — Active when the theme picker is open
+//   Scroll          — Active when the viewport is scrollable (fullscreen mode)
+//   Help            — Active when the help overlay is shown
+//   Attachments     — Active when image attachment navigation is active
+//   Footer          — Active when the footer indicator bar has focus
+//   MessageSelector — Active when the rewind message selector dialog is open
+//   MessageActions  — Active when the message actions bar is visible
+//   DiffDialog      — Active when the diff viewer dialog is open
+//   ModelPicker     — Active when the model picker is open
+//   Select          — Active when a generic select/list component has focus
+//   Plugin          — Active when the plugin management dialog is open
+//
+// ─── Key Action Naming Convention ────────────────────────────────────────────
+// Actions follow the pattern: `category:action`
+//   - app:*           — Application-level actions (redraw, toggleTodos, exit)
+//   - chat:*          — Chat input actions (submit, undo, cycleMode, imagePaste)
+//   - history:*       — Command history navigation
+//   - autocomplete:*  — Autocomplete dropdown actions
+//   - confirm:*       — Confirmation dialog responses
+//   - select:*        — List/select component navigation
+//   - settings:*      — Settings panel actions
+//   - transcript:*    — Transcript modal actions
+//   - historySearch:* — History search modal actions
+//   - task:*          — Running task actions (background)
+//   - theme:*         — Theme picker actions
+//   - scroll:*        — Viewport scrolling actions
+//   - selection:*     — Text selection actions (copy)
+//   - help:*          — Help overlay actions
+//   - attachments:*   — Image attachment navigation
+//   - footer:*        — Footer indicator navigation
+//   - messageSelector:* — Rewind dialog navigation
+//   - messageActions:*  — Message action bar navigation
+//   - diff:*          — Diff dialog navigation
+//   - modelPicker:*   — Model picker actions
+//   - plugin:*        — Plugin dialog actions
+//   - voice:*         — Voice mode actions
+//   - tabs:*          — Tab navigation actions
+// =============================================================================
 import { feature } from 'bun:bundle'
+// Semantic version comparison for checking runtime VT mode support
 import { satisfies } from 'src/utils/semver.js'
+// Checks if running under Bun runtime (vs Node.js) — affects VT mode detection
 import { isRunningWithBun } from '../utils/bundledMode.js'
+// Detects the current OS platform for platform-specific key bindings
 import { getPlatform } from '../utils/platform.js'
 import type { KeybindingBlock } from './types.js'
 
@@ -29,7 +90,14 @@ const SUPPORTS_TERMINAL_VT_MODE =
 // - Other platforms: shift+tab
 const MODE_CYCLE_KEY = SUPPORTS_TERMINAL_VT_MODE ? 'shift+tab' : 'meta+m'
 
+// The complete default keybinding configuration.
+// Each block defines bindings for one context. The resolver walks contexts
+// from most-specific to least-specific, returning the first matching binding.
+// Users can override any binding in their keybindings.json file.
 export const DEFAULT_BINDINGS: KeybindingBlock[] = [
+  // ─── Global Context ──────────────────────────────────────────────────────
+  // Always-active keybindings. These work regardless of which UI mode is active.
+  // Includes: interrupt (ctrl+c), exit (ctrl+d), redraw, toggle panels, history search
   {
     context: 'Global',
     bindings: {
@@ -60,6 +128,10 @@ export const DEFAULT_BINDINGS: KeybindingBlock[] = [
       ...(feature('TERMINAL_PANEL') ? { 'meta+j': 'app:toggleTerminal' } : {}),
     },
   },
+  // ─── Chat Context ──────────────────────────────────────────────────────
+  // Active when the prompt input component has focus. Handles text submission,
+  // mode cycling (normal → plan → bash), history navigation, undo, and
+  // external editor integration. Also includes voice activation bindings.
   {
     context: 'Chat',
     bindings: {
@@ -96,6 +168,9 @@ export const DEFAULT_BINDINGS: KeybindingBlock[] = [
       ...(feature('VOICE_MODE') ? { space: 'voice:pushToTalk' } : {}),
     },
   },
+  // ─── Autocomplete Context ──────────────────────────────────────────────
+  // Active when the autocomplete suggestion dropdown is visible above the input.
+  // Tab accepts, Escape dismisses, arrows navigate between suggestions.
   {
     context: 'Autocomplete',
     bindings: {
@@ -105,6 +180,10 @@ export const DEFAULT_BINDINGS: KeybindingBlock[] = [
       down: 'autocomplete:next',
     },
   },
+  // ─── Settings Context ──────────────────────────────────────────────────
+  // Active when the settings/config panel is open. Provides vi-style navigation
+  // (j/k), Emacs-style navigation (ctrl+n/p), space to toggle, Enter to save,
+  // and search via '/'. The panel uses Select actions for list navigation.
   {
     context: 'Settings',
     bindings: {
@@ -127,6 +206,10 @@ export const DEFAULT_BINDINGS: KeybindingBlock[] = [
       r: 'settings:retry',
     },
   },
+  // ─── Confirmation Context ──────────────────────────────────────────────
+  // Active when a yes/no confirmation dialog is shown (tool permissions,
+  // exit confirmation, etc.). Supports y/n keys, Enter/Escape, and
+  // additional navigation for multi-option dialogs.
   {
     context: 'Confirmation',
     bindings: {
@@ -147,6 +230,9 @@ export const DEFAULT_BINDINGS: KeybindingBlock[] = [
       'ctrl+d': 'permission:toggleDebug',
     },
   },
+  // ─── Tabs Context ──────────────────────────────────────────────────────
+  // Active when tab-based navigation is available (e.g., multi-panel views).
+  // Tab/shift+tab and left/right arrows cycle between tabs.
   {
     context: 'Tabs',
     bindings: {
@@ -157,6 +243,10 @@ export const DEFAULT_BINDINGS: KeybindingBlock[] = [
       left: 'tabs:previous',
     },
   },
+  // ─── Transcript Context ────────────────────────────────────────────────
+  // Active when the transcript modal (ctrl+o) is open. This is a read-only
+  // view of the full conversation. Supports toggle-show-all, exit, and
+  // pager-style 'q' to quit (like less/tmux).
   {
     context: 'Transcript',
     bindings: {
@@ -168,6 +258,10 @@ export const DEFAULT_BINDINGS: KeybindingBlock[] = [
       q: 'transcript:exit',
     },
   },
+  // ─── History Search Context ────────────────────────────────────────────
+  // Active when the ctrl+r reverse history search mode is open.
+  // ctrl+r cycles through matches, tab/escape accepts, Enter executes,
+  // and ctrl+c cancels without accepting.
   {
     context: 'HistorySearch',
     bindings: {
@@ -178,6 +272,9 @@ export const DEFAULT_BINDINGS: KeybindingBlock[] = [
       enter: 'historySearch:execute',
     },
   },
+  // ─── Task Context ──────────────────────────────────────────────────────
+  // Active when a foreground task (bash command, agent) is running.
+  // ctrl+b backgrounds the task so the user can continue chatting.
   {
     context: 'Task',
     bindings: {
@@ -186,12 +283,18 @@ export const DEFAULT_BINDINGS: KeybindingBlock[] = [
       'ctrl+b': 'task:background',
     },
   },
+  // ─── Theme Picker Context ──────────────────────────────────────────────
+  // Active when the theme picker dialog is open.
   {
     context: 'ThemePicker',
     bindings: {
       'ctrl+t': 'theme:toggleSyntaxHighlighting',
     },
   },
+  // ─── Scroll Context ────────────────────────────────────────────────────
+  // Active when the viewport is scrollable (fullscreen/alt-screen mode).
+  // Provides page up/down, mouse wheel, home/end, and clipboard copy
+  // for text selection. Supports both standard and kitty keyboard protocol.
   {
     context: 'Scroll',
     bindings: {
@@ -211,13 +314,18 @@ export const DEFAULT_BINDINGS: KeybindingBlock[] = [
       'cmd+c': 'selection:copy',
     },
   },
+  // ─── Help Context ──────────────────────────────────────────────────────
+  // Active when the help overlay (?) is displayed.
   {
     context: 'Help',
     bindings: {
       escape: 'help:dismiss',
     },
   },
-  // Attachment navigation (select dialog image attachments)
+  // ─── Attachments Context ───────────────────────────────────────────────
+  // Active when the attachment tray (image/file chips) is visible above
+  // the prompt. Left/right cycle through items, backspace/delete removes,
+  // and down/escape exits back to the chat input.
   {
     context: 'Attachments',
     bindings: {
@@ -229,7 +337,10 @@ export const DEFAULT_BINDINGS: KeybindingBlock[] = [
       escape: 'attachments:exit',
     },
   },
-  // Footer indicator navigation (tasks, teams, diff, loop)
+  // ─── Footer Context ─────────────────────────────────────────────────────
+  // Active when the footer indicator bar (tasks, teams, diff, loop count)
+  // has focus. Arrows navigate between footer items, Enter opens, and
+  // Escape clears the selection.
   {
     context: 'Footer',
     bindings: {
@@ -243,7 +354,10 @@ export const DEFAULT_BINDINGS: KeybindingBlock[] = [
       escape: 'footer:clearSelection',
     },
   },
-  // Message selector (rewind dialog) navigation
+  // ─── MessageSelector Context ────────────────────────────────────────────
+  // Active when the rewind/message selector dialog is open. Provides vim-style
+  // (j/k), Emacs-style (ctrl+n/p), and arrow-key navigation. shift/meta/ctrl
+  // modifiers jump to top/bottom of the message list.
   {
     context: 'MessageSelector',
     bindings: {
@@ -264,7 +378,12 @@ export const DEFAULT_BINDINGS: KeybindingBlock[] = [
       enter: 'messageSelector:select',
     },
   },
-  // PromptInput unmounts while cursor active — no key conflict.
+  // ─── MessageActions Context ──────────────────────────────────────────────
+  // Active when the message actions bar is visible (feature-flagged).
+  // PromptInput unmounts while the cursor is in this context, so there are
+  // no key conflicts with chat bindings. Supports vim/arrow navigation,
+  // meta/super+arrow for top/bottom jumps, and shift+arrow for user-message
+  // hopping. 'c' copies, 'p' pins, Enter activates the selected action.
   ...(feature('MESSAGE_ACTIONS')
     ? [
         {
@@ -293,7 +412,11 @@ export const DEFAULT_BINDINGS: KeybindingBlock[] = [
         },
       ]
     : []),
-  // Diff dialog navigation
+  // ─── DiffDialog Context ────────────────────────────────────────────────
+  // Active when the diff viewer dialog is open. Escape dismisses, left/right
+  // cycle between sources (original vs modified), up/down navigate files,
+  // and Enter opens a detailed view. (diff:back is handled by left arrow
+  // contextually when in detail mode.)
   {
     context: 'DiffDialog',
     bindings: {
@@ -306,7 +429,9 @@ export const DEFAULT_BINDINGS: KeybindingBlock[] = [
       // Note: diff:back is handled by left arrow in detail mode
     },
   },
-  // Model picker effort cycling (ant-only)
+  // ─── ModelPicker Context ───────────────────────────────────────────────
+  // Active when the model picker dialog is open (Anthropic-only feature).
+  // Left/right arrows adjust the reasoning effort level.
   {
     context: 'ModelPicker',
     bindings: {
@@ -314,7 +439,10 @@ export const DEFAULT_BINDINGS: KeybindingBlock[] = [
       right: 'modelPicker:increaseEffort',
     },
   },
-  // Select component navigation (used by /model, /resume, permission prompts, etc.)
+  // ─── Select Context ────────────────────────────────────────────────────
+  // Generic list/select component navigation. Used by /model, /resume,
+  // permission prompts, and other dialogs that present a scrollable list.
+  // Supports vim-style (j/k), Emacs-style (ctrl+n/p), and arrow navigation.
   {
     context: 'Select',
     bindings: {
@@ -328,8 +456,10 @@ export const DEFAULT_BINDINGS: KeybindingBlock[] = [
       escape: 'select:cancel',
     },
   },
-  // Plugin dialog actions (manage, browse, discover plugins)
-  // Navigation (select:*) uses the Select context above
+  // ─── Plugin Context ────────────────────────────────────────────────────
+  // Active when the plugin management dialog is open. Space toggles a
+  // plugin on/off, 'i' installs the selected plugin. List navigation
+  // (up/down/enter/escape) is handled by the Select context above.
   {
     context: 'Plugin',
     bindings: {

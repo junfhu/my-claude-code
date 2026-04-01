@@ -1,3 +1,41 @@
+// =============================================================================
+// AgentTool — Sub-agent spawning and lifecycle management
+// =============================================================================
+//
+// Architecture overview:
+// This tool spawns and manages sub-agents — independent Claude instances that
+// run tasks in parallel or sequentially, with their own tool pools, permission
+// modes, and optionally isolated working directories (worktrees).
+//
+// Execution modes:
+// 1. SYNCHRONOUS (default): The parent agent blocks while the sub-agent runs.
+//    Messages are streamed to the UI via onProgress. The sub-agent can be
+//    backgrounded mid-flight via Ctrl+B or auto-background timer.
+// 2. ASYNCHRONOUS (run_in_background=true, or agent def has background:true):
+//    Returns immediately with an async_launched result. The sub-agent runs
+//    independently and produces a <task_notification> on completion.
+// 3. TEAMMATE (multi-agent): Spawns a tmux-based teammate process with its
+//    own terminal pane. Used for parallel collaboration.
+// 4. REMOTE (ant-only): Delegates to a remote CCR environment for isolation.
+// 5. FORK: Experimental path where the child inherits the parent's full
+//    conversation context and system prompt for cache-identical API prefixes.
+//
+// Key design decisions:
+// - WORKTREE ISOLATION: When isolation='worktree', creates a git worktree so
+//   the sub-agent works on an isolated copy. Cleaned up on completion if no
+//   changes were made; kept if the agent made commits.
+// - PERMISSION INHERITANCE: Sub-agents get their own tool pool via
+//   assembleToolPool with the agent definition's permissionMode (typically
+//   'acceptEdits'), independent of the parent's restrictions.
+// - COLOR ASSIGNMENT: Each agent type gets a unique color for UI distinction
+//   via setAgentColor, making multi-agent output visually distinguishable.
+// - MEMORY MANAGEMENT: Agent context (skills, dump state) is cleaned up in
+//   finally blocks to prevent unbounded growth from repeated agent spawns.
+// - FOREGROUND→BACKGROUND TRANSITION: Sync agents register as foreground tasks
+//   and can transition to background mid-execution without losing state.
+//   The backgrounded closure takes over the agent iterator and handles
+//   completion notification independently.
+// =============================================================================
 import { feature } from 'bun:bundle';
 import * as React from 'react';
 import { buildTool, type ToolDef, toolMatchesName } from 'src/Tool.js';
@@ -78,6 +116,18 @@ function getAutoBackgroundMs(): number {
 
 // Multi-agent type constants are defined inline inside gated blocks to enable dead code elimination
 
+// ---- Input Schema (Feature-Gated, Layered) ----
+// The schema is built in layers to support feature flags:
+// - baseInputSchema: always-present fields (description, prompt, subagent_type, model)
+// - fullInputSchema: adds multi-agent params (name, team_name, mode) + isolation + cwd
+// - inputSchema (exported): applies .omit() based on feature gates:
+//   * CLAUDE_CODE_DISABLE_BACKGROUND_TASKS → omits run_in_background
+//   * Fork subagent experiment → omits run_in_background (forces all async)
+//   * KAIROS feature flag → includes/omits cwd
+//
+// AgentToolInput type is explicitly widened to always include optional fields
+// even when omitted from the schema, because call() needs to handle them.
+
 // Base input schema without multi-agent parameters
 const baseInputSchema = lazySchema(() => z.object({
   description: z.string().describe('A short (3-5 word) description of the task'),
@@ -137,6 +187,16 @@ type AgentToolInput = z.infer<ReturnType<typeof baseInputSchema>> & {
   cwd?: string;
 };
 
+// ---- Output Schema (Discriminated Union) ----
+// Two primary output variants:
+// - 'completed': synchronous agent finished, includes content + token counts
+// - 'async_launched': agent running in background, includes taskId + outputFile
+//
+// Internal-only types (excluded from exported schema for dead code elimination):
+// - TeammateSpawnedOutput: multi-agent spawn result (tmux pane info)
+// - RemoteLaunchedOutput: remote CCR launch result (session URL)
+// These are cast through unknown when returned to avoid widening the public API.
+
 // Output schema - multi-agent spawned schema added dynamically at runtime when enabled
 export const outputSchema = lazySchema(() => {
   const syncOutputSchema = agentToolResultSchema().extend({
@@ -193,6 +253,12 @@ import type { AgentToolProgress, ShellProgress } from '../../types/tools.js';
 // AgentTool forwards both its own progress events and shell progress
 // events from the sub-agent so the SDK receives tool_progress updates during bash/powershell runs.
 export type Progress = AgentToolProgress | ShellProgress;
+// ---- AgentTool Definition ----
+// Built via buildTool() factory. Key characteristics:
+// - isReadOnly: always true — the agent tool itself doesn't modify files;
+//   it delegates permission checks to the sub-agent's underlying tools.
+// - isConcurrencySafe: always true — multiple agents can run in parallel.
+// - maxResultSizeChars: 100K — agent results can be substantial.
 export const AgentTool = buildTool({
   async prompt({
     agents,
@@ -236,6 +302,39 @@ export const AgentTool = buildTool({
   get outputSchema(): OutputSchema {
     return outputSchema();
   },
+  // ---- Main Execution Entry Point (Agent Lifecycle Management) ----
+  // The call method is the most complex part of the tool — it handles:
+  //
+  // Phase 1 — Pre-flight:
+  //   - Resolve team context and validate teammate constraints
+  //   - Handle multi-agent spawn (spawnTeammate) when team_name + name set
+  //   - Resolve agent type: explicit → fork (if gate on) → default general-purpose
+  //   - Recursive fork guard: prevents fork children from forking again
+  //   - Filter agents by permission rules and MCP server requirements
+  //   - Wait for pending MCP servers to connect (up to 30s)
+  //   - Assign UI color for the agent type
+  //
+  // Phase 2 — Agent setup:
+  //   - Resolve model (agent def → param override → parent inheritance)
+  //   - Determine isolation mode (worktree / remote / none)
+  //   - Build system prompt (fork: inherit parent's; normal: agent-specific)
+  //   - Build prompt messages (fork: cloned parent context; normal: user message)
+  //   - Assemble independent tool pool for the worker
+  //   - Create worktree if isolation='worktree'
+  //
+  // Phase 3 — Execution (branched on shouldRunAsync):
+  //   ASYNC PATH: registerAsyncAgent → fire-and-forget runAsyncAgentLifecycle
+  //     → returns async_launched immediately
+  //   SYNC PATH: registerAgentForeground → message loop with background race
+  //     → Progress streaming via onProgress → finalizeAgentTool on completion
+  //     → Can transition to background mid-flight (wasBackgrounded flag)
+  //
+  // Phase 4 — Cleanup (in finally blocks):
+  //   - Clear agent skills and dump state
+  //   - Unregister foreground task
+  //   - Cancel auto-background timer
+  //   - Clean up worktree (remove if no changes, keep if commits exist)
+  //   - Notify SDK with final task status
   async call({
     prompt,
     subagent_type,
@@ -315,6 +414,7 @@ export const AgentTool = buildTool({
       };
     }
 
+    // ---- Agent Type Resolution ----
     // Fork subagent experiment routing:
     // - subagent_type set: use it (explicit wins)
     // - subagent_type omitted, gate on: fork path (undefined)
@@ -565,6 +665,7 @@ export const AgentTool = buildTool({
     // below (registerAsyncAgentTask + notifyOnCompletion).
     const assistantForceAsync = feature('KAIROS') ? appState.kairosEnabled : false;
     const shouldRunAsync = (run_in_background === true || selectedAgent.background === true || isCoordinator || forceAsync || assistantForceAsync || (proactiveModule?.isProactiveActive() ?? false)) && !isBackgroundTasksDisabled;
+    // ---- Worker Tool Pool Assembly ----
     // Assemble the worker's tool pool independently of the parent's.
     // Workers always get their tools from assembleToolPool with their own
     // permission mode, so they aren't affected by the parent's tool
@@ -683,6 +784,21 @@ export const AgentTool = buildTool({
         worktreeBranch
       };
     };
+    // ---- Async Agent Launch Path ----
+    // When shouldRunAsync is true, the agent is registered as a background task
+    // and execution is fire-and-forget. The parent agent gets an immediate
+    // async_launched response with the task ID and output file path.
+    //
+    // Key aspects:
+    // - Background agents DON'T inherit the parent's abort controller — they
+    //   survive when the user presses ESC. They're killed explicitly via
+    //   chat:killAgents.
+    // - The name→agentId mapping is registered AFTER task registration to
+    //   avoid stale entries if spawn fails.
+    // - runAsyncAgentLifecycle handles the full lifecycle: run agent, track
+    //   progress, finalize, enqueue notification.
+    // - Workload context is inherited via AsyncLocalStorage (ALS) at invocation
+    //   time — no explicit capture/restore needed.
     if (shouldRunAsync) {
       const asyncAgentId = earlyAgentId;
       const agentBackgroundTask = registerAsyncAgent({
@@ -763,6 +879,27 @@ export const AgentTool = buildTool({
         }
       };
     } else {
+      // ---- Synchronous Agent Execution Path ----
+      // The parent agent blocks while the sub-agent runs. Messages from the
+      // sub-agent are collected and forwarded as progress events. The agent
+      // can transition to background mid-flight via Ctrl+B or auto-background.
+      //
+      // Message loop architecture:
+      // - runAgent returns an async iterator of messages
+      // - Each iteration races the next message against a background signal
+      // - If backgrounded: the iterator is transferred to a detached closure
+      //   that continues the agent independently
+      // - If message received: it's collected, progress is tracked, and
+      //   tool_use/tool_result events are forwarded to the parent's onProgress
+      // - On completion: finalizeAgentTool aggregates all messages into a result
+      //
+      // Cleanup is handled in a comprehensive finally block that:
+      // - Clears the background hint UI
+      // - Stops summarization
+      // - Unregisters foreground task
+      // - Cleans up agent skills and dump state
+      // - Cancels auto-background timer
+      // - Cleans up worktree (if not backgrounded — the closure owns it)
       // Create an explicit agentId for sync agents
       const syncAgentId = asAgentId(earlyAgentId);
 
@@ -805,7 +942,12 @@ export const AgentTool = buildTool({
           }
         }
 
+        // ---- Foreground→Background Transition ----
         // Register as foreground task immediately so it can be backgrounded at any time
+        // The backgroundPromise is created once (not per-iteration) to avoid
+        // accumulating .then() callbacks on the same pending promise.
+        // When the background signal fires (Ctrl+B or auto-background timer),
+        // the message loop breaks and the agent transitions to async execution.
         // Skip registration if background tasks are disabled
         let foregroundTaskId: string | undefined;
         // Create the background race promise once outside the loop — otherwise
@@ -1278,6 +1420,11 @@ export const AgentTool = buildTool({
   getActivityDescription(input) {
     return input?.description ?? 'Running task';
   },
+  // ---- Permission Check ----
+  // In most modes, sub-agent spawning is auto-approved because the sub-agent's
+  // own tools handle their own permission checks independently.
+  // In 'auto' mode (ant-only), permission is delegated to the auto-mode
+  // classifier via 'passthrough' behavior.
   async checkPermissions(input, context): Promise<PermissionResult> {
     const appState = context.getAppState();
 
@@ -1295,6 +1442,10 @@ export const AgentTool = buildTool({
       updatedInput: input
     };
   },
+  // ---- Model-Facing Output Serialization ----
+  // Converts the typed output data into the ToolResultBlockParam format for
+  // the Claude API. Handles the internal-only output types (teammate_spawned,
+  // remote_launched) via type narrowing on the status field.
   mapToolResultToToolResultBlockParam(data, toolUseID) {
     // Multi-agent spawn result
     const internalData = data as InternalOutput;
@@ -1385,6 +1536,9 @@ duration_ms: ${data.totalDurationMs}</usage>`
   renderToolUseErrorMessage,
   renderGroupedToolUse: renderGroupedAgentToolUse
 } satisfies ToolDef<InputSchema, Output, Progress>);
+// ---- Team Name Resolution Helper ----
+// Resolves the effective team name from explicit param or inherited team context.
+// Returns undefined when agent swarms are disabled (gated feature).
 function resolveTeamName(input: {
   team_name?: string;
 }, appState: {
