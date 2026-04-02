@@ -1,0 +1,112 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "claude-code"
+version = "0.0.0-leaked"
+description = "Anthropic Claude Code CLI — Python rewrite of leaked source (2026-03-31)"
+readme = "README.md"
+license = "UNLICENSED"
+requires-python = ">=3.11"
+dependencies = [
+    # Core Anthropic SDK
+    "anthropic>=0.39.0",
+    # CLI framework (replaces Commander.js)
+    "click>=8.1.0",
+    # Terminal UI (replaces React/Ink)
+    "textual>=0.80.0",
+    "rich>=13.9.0",
+    # MCP protocol
+    "mcp>=1.0.0",
+    # Data validation (replaces Zod)
+    "pydantic>=2.9.0",
+    # HTTP client (replaces undici/axios)
+    "httpx>=0.27.0",
+    # WebSocket client (replaces ws)
+    "websockets>=13.0",
+    # Process management (replaces execa, tree-kill)
+    "psutil>=6.0.0",
+    # PTY support (replaces node-pty)
+    "pexpect>=4.9.0",
+    # File watching (replaces chokidar)
+    "watchdog>=4.0.0",
+    # Fuzzy search (replaces fuse.js)
+    "rapidfuzz>=3.9.0",
+    # Syntax highlighting (replaces highlight.js)
+    "pygments>=2.18.0",
+    # YAML support
+    "pyyaml>=6.0",
+    # Markdown rendering (replaces marked)
+    "markdown>=3.7",
+    # Diff utilities (replaces diff)
+    "unidiff>=0.7.0",
+    # Semver support
+    "semver>=3.0.0",
+    # QR code generation (replaces qrcode)
+    "qrcode>=7.4",
+    # HTML sanitization (replaces xss)
+    "bleach>=6.0.0",
+    # HTML to text (replaces turndown)
+    "html2text>=2024.0",
+    # Proxy support (replaces https-proxy-agent)
+    "httpx[socks]>=0.27.0",
+    # File ignore patterns (replaces ignore)
+    "pathspec>=0.12.0",
+    # LRU cache (stdlib + cachetools)
+    "cachetools>=5.5.0",
+    # Async support
+    "anyio>=4.4.0",
+    # OpenTelemetry (replaces @opentelemetry/*)
+    "opentelemetry-api>=1.27.0",
+    "opentelemetry-sdk>=1.27.0",
+    # JSON-RPC (replaces vscode-jsonrpc)
+    "jsonrpcserver>=5.0.0",
+    "jsonrpcclient>=4.0.0",
+    # Compression (replaces fflate)
+    "zstandard>=0.23.0",
+    # Feature flags (replaces @growthbook/growthbook)
+    "growthbook>=1.0.0",
+    # ANSI processing (replaces strip-ansi, @alcalzone/ansi-tokenize)
+    "strip-ansi>=0.1.0",
+    # Chart rendering (replaces asciichart)
+    "asciichartpy>=1.5.0",
+    # Lockfile (replaces proper-lockfile)
+    "filelock>=3.15.0",
+    # Shell quoting (replaces shell-quote)
+    # Python stdlib shlex handles this
+    # JSONC parsing (replaces jsonc-parser)
+    "json5>=0.9.0",
+    # Env path management (replaces env-paths)
+    "platformdirs>=4.3.0",
+    # Concurrent mapping (replaces p-map)
+    # Python stdlib asyncio handles this
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "mypy>=1.11.0",
+    "ruff>=0.6.0",
+]
+
+[project.scripts]
+claude = "claude_code.entrypoints.cli:main"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "SIM", "TCH"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
